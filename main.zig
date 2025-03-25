@@ -225,16 +225,17 @@ fn startDaemon(alc: std.mem.Allocator, socket_path: []const u8, log_path: []cons
         .state = &state,
     });
 
-    try state.epoll.addEvent(state.battery.ac_netlink.sock.handle, .{
-        .callback = DaemonState.acCallback,
-        .state = &state,
-    });
+    if (state.battery) |battery| {
+        try state.epoll.addEvent(battery.ac_netlink.sock.handle, .{
+            .callback = DaemonState.acCallback,
+            .state = &state,
+        });
 
-    try state.epoll.addEvent(state.battery.timer_fd, .{
-        .callback = DaemonState.batteryCapacityCallback,
-        .state = &state,
-    });
-
+        try state.epoll.addEvent(battery.timer_fd, .{
+            .callback = DaemonState.batteryCapacityCallback,
+            .state = &state,
+        });
+    }
     if (state.datetime.inotify) |i| {
         try state.epoll.addEvent(i.file.handle, .{
             .callback = DaemonState.maybeUpdateTimezoneCallback,
@@ -264,7 +265,7 @@ const DaemonState = struct {
 
     audio: Audio,
 
-    battery: Battery,
+    battery: ?Battery,
 
     datetime: DateTime,
     time: Buf(32) = .{},
@@ -319,8 +320,8 @@ const DaemonState = struct {
         var audio = try Audio.init();
         errdefer audio.deinit();
 
-        var battery = try Battery.init();
-        errdefer battery.deinit();
+        const battery = try Battery.init();
+        errdefer if (battery) |b| b.deinit();
 
         var datetime = try DateTime.init(alc);
         errdefer datetime.deinit();
@@ -349,7 +350,7 @@ const DaemonState = struct {
 
         self.epoll.deinit();
         self.audio.deinit();
-        self.battery.deinit();
+        if (self.battery) |b| b.deinit();
         self.datetime.deinit();
     }
 
@@ -361,9 +362,18 @@ const DaemonState = struct {
 
     fn writeStatus(self: Self) !void {
         const w = std.io.getStdOut().writer();
+        var battery_buf: [8]u8 = undefined;
+        const battery = if (self.battery) |b| try std.fmt.bufPrint(&battery_buf, "{s}[{}%] ", .{
+            switch (b.ac_status) {
+                .online => "^",
+                .offline => "",
+                .unknown => "?",
+            },
+            b.capacity,
+        }) else "";
         try w.print("[{{\"full_text\":\"{s} \"}}," ++
             // pango markup to have volume struck out when muted
-            "{{\"markup\":\"pango\",\"full_text\": \" ({s}{s}{d:.2}{s}) {s}[{}%] {s}\"}}],", .{
+            "{{\"markup\":\"pango\",\"full_text\": \" ({s}{s}{d:.2}{s}) {s}{s}\"}}],", .{
             self.message.slice(),
             switch (self.audio.sink) {
                 .bluetooth => "bt: ",
@@ -372,12 +382,7 @@ const DaemonState = struct {
             if (self.audio.muted) "<s>" else "",
             self.audio.volume,
             if (self.audio.muted) "</s>" else "",
-            switch (self.battery.ac_status) {
-                .online => "^",
-                .offline => "",
-                .unknown => "?",
-            },
-            self.battery.capacity,
+            battery,
             self.time.slice(),
         });
     }
@@ -422,7 +427,7 @@ const DaemonState = struct {
 
     fn acCallback(data: *anyopaque, _: std.posix.fd_t) !void {
         const self: *DaemonState = @alignCast(@ptrCast(data));
-        self.battery.ac_status = try self.battery.ac_netlink.getAcStatus() orelse return;
+        self.battery.?.ac_status = try self.battery.?.ac_netlink.getAcStatus() orelse return;
         try self.writeStatus();
     }
 
@@ -430,9 +435,9 @@ const DaemonState = struct {
         const self: *DaemonState = @alignCast(@ptrCast(data));
 
         var buf: [8]u8 = undefined;
-        _ = try std.posix.read(self.battery.timer_fd, &buf);
+        _ = try std.posix.read(self.battery.?.timer_fd, &buf);
 
-        self.battery.capacity = try Battery.getNewCapacity(self.battery.cap_files);
+        self.battery.?.capacity = try Battery.getNewCapacity(self.battery.?.cap_files);
         try self.writeStatus();
     }
 
@@ -536,13 +541,17 @@ const Battery = struct {
     // timer for reading current battery capacity
     timer_fd: i32,
 
-    fn init() !Battery {
+    fn init() !?Battery {
+        const ac = std.fs.openFileAbsolute("/sys/class/power_supply/AC/online", .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer ac.close();
+
         var nl = try Netlink.init();
         errdefer nl.deinit();
 
         try nl.subscribeToAcpiEvents();
-        const ac = try std.fs.openFileAbsolute("/sys/class/power_supply/AC/online", .{});
-        defer ac.close();
 
         const ac_status: Netlink.AcStatus = switch (try ac.reader().readByte()) {
             0 => .offline,
