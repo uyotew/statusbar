@@ -1,10 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
-    std.log.err(fmt, args);
-    std.process.exit(1);
-}
+const fatal = std.process.fatal;
 
 fn usage(progname: []const u8) noreturn {
     std.log.info(
@@ -17,10 +14,10 @@ fn usage(progname: []const u8) noreturn {
         \\     if a line of output is too long, it will be divided into pieces
         \\     max line length might be an option later
         \\ 
-        \\    --help    this
+        \\    --help -h   this
         \\
-        \\    --start   starts the daemon (must be the only arg)
-        \\    --log     prints the full log to stdout (must be the only arg)
+        \\    --start     starts the daemon (must be the only arg)
+        \\    --log       prints the full log to stdout (must be the only arg)
         \\
         \\  
         \\  args valid when running a child command: (all optional)
@@ -53,42 +50,42 @@ const Args = union(enum) {
         cmd: []const []const u8,
     };
 
-    fn parse(in_with_progname: []const []const u8) !Args {
-        const progname = in_with_progname[0];
-        const in = in_with_progname[1..];
-        if (in.len == 0) usage(progname);
+    fn parse(raw_args: []const []const u8) !Args {
+        const progname = raw_args[0];
+        const args = raw_args[1..];
+        if (args.len == 0) usage(progname);
 
         var send: Send = .{ .cmd = undefined };
         var no_name = false;
         var args_idx: usize = 0;
-        while (args_idx < in.len) : (args_idx += 1) {
-            const arg = in[args_idx];
-            if (std.mem.eql(u8, "--help", arg)) {
+        while (args_idx < args.len) : (args_idx += 1) {
+            const arg = args[args_idx];
+            if (std.mem.eql(u8, "--help", arg) or std.mem.eql(u8, "-h", arg)) {
                 usage(progname);
             } else if (std.mem.eql(u8, "--log", arg)) {
-                if (in.len == 1) return Args.log;
+                if (args.len == 1) return Args.log;
                 send.log = true;
             } else if (std.mem.eql(u8, "--start", arg)) {
-                if (in.len != 1) fatal("--start can only appear alone", .{});
+                if (args.len != 1) fatal("--start can only appear alone", .{});
                 return Args.start;
             } else if (std.mem.eql(u8, "--name", arg)) {
                 args_idx += 1;
-                if (args_idx >= in.len) fatal("--name expects an argument", .{});
-                send.name = in[args_idx];
+                if (args_idx >= args.len) fatal("--name expects an argument", .{});
+                send.name = args[args_idx];
             } else if (std.mem.eql(u8, "--no-name", arg)) {
                 no_name = true;
             } else if (std.mem.eql(u8, "--retain", arg)) {
                 args_idx += 1;
-                if (args_idx >= in.len) fatal("--retain expects an argument", .{});
-                send.retain = std.fmt.parseUnsigned(@TypeOf(send.retain), in[args_idx], 10) catch |err| switch (err) {
+                if (args_idx >= args.len) fatal("--retain expects an argument", .{});
+                send.retain = std.fmt.parseUnsigned(@TypeOf(send.retain), args[args_idx], 10) catch |err| switch (err) {
                     error.Overflow => fatal("--retain can at most be {}", .{std.math.maxInt(@TypeOf(send.retain))}),
-                    error.InvalidCharacter => fatal("--retain invalid number: {s}", .{in[args_idx]}),
+                    error.InvalidCharacter => fatal("--retain invalid number: {s}", .{args[args_idx]}),
                 };
             } else break;
         }
-        if (args_idx == in.len) fatal("expected cmd after options", .{});
-        send.cmd = in[args_idx..];
-        if (!no_name and send.name == null) send.name = in[args_idx];
+        if (args_idx == args.len) fatal("expected cmd after options", .{});
+        send.cmd = args[args_idx..];
+        if (!no_name and send.name == null) send.name = args[args_idx];
         return Args{ .send = send };
     }
 };
@@ -97,7 +94,7 @@ pub fn main() !void {
     const status_socket_name = "statusbar-0";
     const log_file_name = "statusbar-0.log";
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer std.debug.assert(.ok == gpa.deinit());
     const alc = gpa.allocator();
 
@@ -260,35 +257,21 @@ const DaemonState = struct {
 
     epoll: Epoll,
 
-    message: Buf(256) = .{},
+    message: std.BoundedArray(u8, 256) = .{},
 
     audio: Audio,
 
     battery: Battery,
 
     datetime: DateTime,
-    time: Buf(32) = .{},
+    time: std.BoundedArray(u8, 32) = .{},
 
     const Self = @This();
-
-    fn Buf(comptime size: usize) type {
-        return struct {
-            buf: [size]u8 = undefined,
-            len: usize = 0,
-            fn slice(self: *const @This()) []const u8 {
-                return self.buf[0..self.len];
-            }
-            fn copyFrom(self: *@This(), bytes: []const u8) void {
-                @memcpy(self.buf[0..bytes.len], bytes);
-                self.len = bytes.len;
-            }
-        };
-    }
 
     fn init(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8) !Self {
         // handle common signals, so temporary files (log and socket) get
         // removed when the process gets terminated (most of the time)
-        // usually, the process isn't suppose to terminate until you power off though
+        // usually, the process isn't supposed to terminate until you power off though
         // but sending these signals is the only way to shut down the daemon as well
         // mostly debugging convenience
         // but also helpful when reloading the sway config?
@@ -400,7 +383,7 @@ const DaemonState = struct {
 
     fn connectionReadCallback(data: *anyopaque, conn_fd: std.posix.fd_t) !void {
         const self: *DaemonState = @alignCast(@ptrCast(data));
-        var fbs = std.io.fixedBufferStream(&self.message.buf);
+        var fbs = std.io.fixedBufferStream(&self.message.buffer);
         const reader = (std.net.Stream{ .handle = conn_fd }).reader();
         // this will not block long, since every message sent by the sender
         // has to end in a newline, and is sent in full
@@ -442,14 +425,14 @@ const DaemonState = struct {
         var buf: [8]u8 = undefined;
         _ = try std.posix.read(self.datetime.timer_fd, &buf);
 
-        self.time.len = self.datetime.getTime(&self.time.buf).len;
+        self.time.len = self.datetime.getTime(&self.time.buffer).len;
         try self.writeStatus();
     }
 
     fn maybeUpdateTimezoneCallback(data: *anyopaque, _: std.posix.fd_t) !void {
         const self: *DaemonState = @alignCast(@ptrCast(data));
         if (try self.datetime.maybeUpdateTimezone()) {
-            self.time.len = self.datetime.getTime(&self.time.buf).len;
+            self.time.len = self.datetime.getTime(&self.time.buffer).len;
             try self.writeStatus();
         }
     }
