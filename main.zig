@@ -414,16 +414,16 @@ const Battery = struct {
         };
         defer ac.close();
 
+        const ac_status: Netlink.AcStatus = switch (try ac.reader().readByte()) {
+            '0' => .offline,
+            '1' => .online,
+            else => .unknown,
+        };
+
         var nl = try Netlink.init();
         errdefer nl.deinit();
 
         try nl.subscribeToAcpiEvents();
-
-        const ac_status: Netlink.AcStatus = switch (try ac.reader().readByte()) {
-            0 => .offline,
-            1 => .online,
-            else => .unknown,
-        };
 
         const b0 = std.fs.openFileAbsolute("/sys/class/power_supply/BAT0/capacity", .{}) catch |err| switch (err) {
             error.FileNotFound => null,
