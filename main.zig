@@ -113,7 +113,11 @@ pub fn main() !void {
     switch (try Args.parse(args_input)) {
         .log => try printLog(alc, log_path),
         .send => |args| try sendOutputToDaemon(alc, args, socket_path),
-        .start => try startDaemon(alc, socket_path, log_path),
+        .start => {
+            var daemon: Daemon = try .init(alc, socket_path, log_path);
+            defer daemon.deinit(socket_path, log_path);
+            try daemon.run();
+        },
     }
 }
 
@@ -208,68 +212,19 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
     _ = try child.wait();
 }
 
-fn startDaemon(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8) !void {
-    var state = try DaemonState.init(alc, socket_path, log_path);
-    defer state.deinit(socket_path, log_path);
-
-    try state.epoll.addEvent(state.signal_fd, .{
-        .callback = DaemonState.signalCallback,
-        .state = &state,
-    });
-
-    try state.epoll.addEvent(state.server.stream.handle, .{
-        .callback = DaemonState.serverAcceptCallback,
-        .state = &state,
-    });
-
-    if (state.battery) |battery| {
-        try state.epoll.addEvent(battery.ac_netlink.sock.handle, .{
-            .callback = DaemonState.acCallback,
-            .state = &state,
-        });
-
-        try state.epoll.addEvent(battery.timer_fd, .{
-            .callback = DaemonState.batteryCapacityCallback,
-            .state = &state,
-        });
-    }
-    if (state.datetime.inotify) |i| {
-        try state.epoll.addEvent(i.file.handle, .{
-            .callback = DaemonState.maybeUpdateTimezoneCallback,
-            .state = &state,
-        });
-    }
-
-    try state.epoll.addEvent(state.datetime.timer_fd, .{
-        .callback = DaemonState.getTimeCallback,
-        .state = &state,
-    });
-
-    try state.epoll.run();
-}
-
-const DaemonState = struct {
+const Daemon = struct {
     alc: std.mem.Allocator,
-
     signal_fd: std.posix.fd_t,
-
     server: std.net.Server,
     log_file: std.fs.File,
-
-    epoll: Epoll,
-
+    epoll_fd: i32,
     message: std.BoundedArray(u8, 256) = .{},
-
     audio: Audio,
-
-    battery: ?Battery,
-
     datetime: DateTime,
     time: std.BoundedArray(u8, 32) = .{},
+    battery: ?Battery,
 
-    const Self = @This();
-
-    fn init(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8) !Self {
+    fn init(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8) !Daemon {
         // handle common signals, so temporary files (log and socket) get
         // removed when the process gets terminated (most of the time)
         // usually, the process isn't supposed to terminate until you power off though
@@ -297,9 +252,6 @@ const DaemonState = struct {
         errdefer std.fs.deleteFileAbsolute(log_path) catch unreachable;
         errdefer log_file.close();
 
-        var epoll = try Epoll.init(alc);
-        errdefer epoll.deinit();
-
         var audio = try Audio.init();
         errdefer audio.deinit();
 
@@ -309,191 +261,122 @@ const DaemonState = struct {
         var datetime = try DateTime.init(alc);
         errdefer datetime.deinit();
 
-        try writeStatusInit();
+        const epoll_fd = try std.posix.epoll_create1(0);
+        errdefer std.posix.close(epoll_fd);
+
+        try addToEpoll(epoll_fd, signal_fd);
+        try addToEpoll(epoll_fd, server.stream.handle);
+        try addToEpoll(epoll_fd, datetime.timer_fd);
+        if (battery) |b| {
+            try addToEpoll(epoll_fd, b.ac_netlink.sock.handle);
+            try addToEpoll(epoll_fd, b.timer_fd);
+        }
 
         return .{
             .alc = alc,
             .signal_fd = signal_fd,
             .server = server,
             .log_file = log_file,
-            .epoll = epoll,
+            .epoll_fd = epoll_fd,
             .audio = audio,
-            .battery = battery,
             .datetime = datetime,
+            .battery = battery,
         };
     }
+    fn addToEpoll(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
+        const EPOLL = std.os.linux.EPOLL;
+        var ev: std.os.linux.epoll_event = .{ .data = .{ .fd = fd }, .events = EPOLL.IN };
+        try std.posix.epoll_ctl(epoll_fd, EPOLL.CTL_ADD, fd, &ev);
+    }
 
-    fn deinit(self: *Self, socket_path: []const u8, log_path: []const u8) void {
-        std.posix.close(self.signal_fd);
-        self.server.deinit();
+    fn deinit(d: *Daemon, socket_path: []const u8, log_path: []const u8) void {
+        std.posix.close(d.signal_fd);
+        d.server.deinit();
 
         std.fs.deleteFileAbsolute(socket_path) catch unreachable;
         std.fs.deleteFileAbsolute(log_path) catch unreachable;
-        self.log_file.close();
+        d.log_file.close();
 
-        self.epoll.deinit();
-        self.audio.deinit();
-        if (self.battery) |b| b.deinit();
-        self.datetime.deinit();
+        std.posix.close(d.epoll_fd);
+        d.audio.deinit();
+        if (d.battery) |b| b.deinit();
+        d.datetime.deinit();
     }
 
-    /// header for swaybar-protocol
-    fn writeStatusInit() !void {
-        const w = std.io.getStdOut().writer();
-        try w.writeAll("{\"version\":1}\n[");
-    }
-
-    fn writeStatus(self: Self) !void {
-        const w = std.io.getStdOut().writer();
-        var battery_buf: [8]u8 = undefined;
-        const battery = if (self.battery) |b| try std.fmt.bufPrint(&battery_buf, "{s}[{}%] ", .{
-            switch (b.ac_status) {
-                .online => "^",
-                .offline => "",
-                .unknown => "?",
-            },
-            b.capacity,
-        }) else "";
-        try w.print("[{{\"full_text\":\"{s} \"}}," ++
-            // pango markup to have volume struck out when muted
-            "{{\"markup\":\"pango\",\"full_text\": \" ({s}{s}{d:.2}{s}) {s}{s}\"}}],", .{
-            self.message.slice(),
-            switch (self.audio.sink) {
-                .bluetooth => "bt: ",
-                .speakers => "",
-            },
-            if (self.audio.muted) "<s>" else "",
-            self.audio.volume,
-            if (self.audio.muted) "</s>" else "",
-            battery,
-            self.time.slice(),
-        });
-    }
-
-    fn signalCallback(_: *anyopaque, _: std.posix.fd_t) !void {
-        // returning an error will make the epoll loop exit,
-        // and the deferred clean up functions will be called
-        return error.RecievedIntOrTermSignal;
-    }
-
-    fn serverAcceptCallback(data: *anyopaque, _: std.posix.fd_t) !void {
-        const self: *DaemonState = @alignCast(@ptrCast(data));
-        const conn = try self.server.accept();
-        errdefer conn.stream.close();
-        try self.epoll.addEvent(conn.stream.handle, .{
-            .callback = connectionReadCallback,
-            .state = self,
-        });
-    }
-
-    fn connectionReadCallback(data: *anyopaque, conn_fd: std.posix.fd_t) !void {
-        const self: *DaemonState = @alignCast(@ptrCast(data));
-        var fbs = std.io.fixedBufferStream(&self.message.buffer);
-        const reader = (std.net.Stream{ .handle = conn_fd }).reader();
-        // this will not block long, since every message sent by the sender
-        // has to end in a newline, and is sent in full
-        reader.streamUntilDelimiter(fbs.writer(), '\n', fbs.buffer.len) catch |err| switch (err) {
-            error.EndOfStream => {
-                try self.epoll.removeEvent(conn_fd);
-                return;
-            },
-            else => return err,
-        };
-        self.message.len = fbs.pos;
-        try self.writeStatus();
-        // logging
-        const timestamp = std.time.timestamp();
-        try self.log_file.writeAll(&std.mem.toBytes(timestamp));
-        try self.log_file.writeAll(self.message.slice());
-        try self.log_file.writeAll("\n");
-    }
-
-    fn acCallback(data: *anyopaque, _: std.posix.fd_t) !void {
-        const self: *DaemonState = @alignCast(@ptrCast(data));
-        self.battery.?.ac_status = try self.battery.?.ac_netlink.getAcStatus() orelse return;
-        try self.writeStatus();
-    }
-
-    fn batteryCapacityCallback(data: *anyopaque, _: std.posix.fd_t) !void {
-        const self: *DaemonState = @alignCast(@ptrCast(data));
-
-        var buf: [8]u8 = undefined;
-        _ = try std.posix.read(self.battery.?.timer_fd, &buf);
-
-        self.battery.?.capacity = try Battery.getNewCapacity(self.battery.?.cap_files);
-        try self.writeStatus();
-    }
-
-    fn getTimeCallback(data: *anyopaque, _: std.posix.fd_t) !void {
-        const self: *DaemonState = @alignCast(@ptrCast(data));
-
-        var buf: [8]u8 = undefined;
-        _ = try std.posix.read(self.datetime.timer_fd, &buf);
-
-        self.time.len = self.datetime.getTime(&self.time.buffer).len;
-        try self.writeStatus();
-    }
-
-    fn maybeUpdateTimezoneCallback(data: *anyopaque, _: std.posix.fd_t) !void {
-        const self: *DaemonState = @alignCast(@ptrCast(data));
-        if (try self.datetime.maybeUpdateTimezone()) {
-            self.time.len = self.datetime.getTime(&self.time.buffer).len;
-            try self.writeStatus();
-        }
-    }
-};
-
-const Epoll = struct {
-    epoll_fd: i32,
-    events: EventMap,
-
-    const EventMap = std.AutoHashMap(std.posix.fd_t, Event);
-
-    const Event = struct {
-        callback: *const fn (*anyopaque, std.posix.fd_t) anyerror!void,
-        state: *anyopaque,
-    };
-
-    const EPOLL = std.os.linux.EPOLL;
-
-    fn init(alc: std.mem.Allocator) !Epoll {
-        return .{
-            .epoll_fd = try std.posix.epoll_create1(0),
-            .events = EventMap.init(alc),
-        };
-    }
-
-    /// does not close event file descriptors
-    fn deinit(self: *Epoll) void {
-        std.posix.close(self.epoll_fd);
-        self.events.deinit();
-    }
-
-    /// Event.state must be freed by caller when done
-    /// should i use EPOLL.ET?
-    fn addEvent(self: *Epoll, fd: std.posix.fd_t, event: Event) !void {
-        var ev: std.os.linux.epoll_event = .{
-            .data = .{ .fd = fd },
-            .events = EPOLL.IN,
-        };
-        try std.posix.epoll_ctl(self.epoll_fd, EPOLL.CTL_ADD, fd, &ev);
-        try self.events.putNoClobber(fd, event);
-    }
-
-    fn removeEvent(self: *Epoll, fd: std.posix.fd_t) !void {
-        std.debug.assert(self.events.remove(fd));
-        try std.posix.epoll_ctl(self.epoll_fd, EPOLL.CTL_DEL, fd, null);
-        std.posix.close(fd);
-    }
-
-    fn run(self: Epoll) !void {
+    fn run(d: *Daemon) !void {
         const wait_max_events = 16;
         var events: [wait_max_events]std.os.linux.epoll_event = undefined;
+
+        const w = std.io.getStdOut().writer();
+        // header for swaybar-protocol
+        try w.writeAll("{\"version\":1}\n[");
+
         while (true) {
-            const n_fds = std.posix.epoll_wait(self.epoll_fd, &events, -1);
+            var battery_buf: [8]u8 = undefined;
+            const battery_msg = if (d.battery) |b| try std.fmt.bufPrint(&battery_buf, "{s}[{}%] ", .{
+                switch (b.ac_status) {
+                    .online => "^",
+                    .offline => "",
+                    .unknown => "?",
+                },
+                b.capacity,
+            }) else "";
+            try w.print("[{{\"full_text\":\"{s} \"}}," ++
+                // pango markup to have volume struck out when muted
+                "{{\"markup\":\"pango\",\"full_text\": \" ({s}{s}{d:.2}{s}) {s}{s}\"}}],", .{
+                d.message.slice(),
+                switch (d.audio.sink) {
+                    .bluetooth => "bt: ",
+                    .speakers => "",
+                },
+                if (d.audio.muted) "<s>" else "",
+                d.audio.volume,
+                if (d.audio.muted) "</s>" else "",
+                battery_msg,
+                d.time.slice(),
+            });
+
+            const n_fds = std.posix.epoll_wait(d.epoll_fd, &events, -1);
             for (events[0..n_fds]) |ev| {
-                const event = self.events.get(ev.data.fd) orelse unreachable;
-                try event.callback(event.state, ev.data.fd);
+                const fd = ev.data.fd;
+                if (fd == d.signal_fd) {
+                    // exit when recieving int or term signals
+                    return;
+                } else if (fd == d.server.stream.handle) {
+                    const conn = try d.server.accept();
+                    try addToEpoll(d.epoll_fd, conn.stream.handle);
+                } else if (fd == d.datetime.timer_fd) {
+                    var buf: [8]u8 = undefined;
+                    _ = try std.posix.read(d.datetime.timer_fd, &buf); //reset timer
+                    d.time.len = d.datetime.getTime(&d.time.buffer).len;
+                } else if (d.battery != null and fd == d.battery.?.ac_netlink.sock.handle) {
+                    d.battery.?.ac_status = try d.battery.?.ac_netlink.getAcStatus() orelse continue;
+                } else if (d.battery != null and fd == d.battery.?.timer_fd) {
+                    var buf: [8]u8 = undefined;
+                    _ = try std.posix.read(d.battery.?.timer_fd, &buf); //reset timer
+                    d.battery.?.capacity = try Battery.getNewCapacity(d.battery.?.cap_files);
+                } else {
+                    // handle messages from connection accepted earlier
+                    var fbs = std.io.fixedBufferStream(&d.message.buffer);
+                    const reader = (std.net.Stream{ .handle = fd }).reader();
+                    // this will not block long, since every message sent by the sender
+                    // has to end in a newline, and is sent in full
+                    reader.streamUntilDelimiter(fbs.writer(), '\n', fbs.buffer.len) catch |err| switch (err) {
+                        error.EndOfStream => {
+                            const EPOLL = std.os.linux.EPOLL;
+                            try std.posix.epoll_ctl(d.epoll_fd, EPOLL.CTL_DEL, fd, null);
+                            std.posix.close(fd);
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    d.message.len = fbs.pos;
+                    // logging
+                    const timestamp = std.time.timestamp();
+                    try d.log_file.writeAll(&std.mem.toBytes(timestamp));
+                    try d.log_file.writeAll(d.message.slice());
+                    try d.log_file.writeAll("\n");
+                }
             }
         }
     }
@@ -824,15 +707,7 @@ const Battery = struct {
 };
 
 const DateTime = struct {
-    /// if null, the timezone was set by an environment variable
-    /// and cannot change dynamically
-    inotify: ?struct {
-        /// when readable, a new timezone should maybe be loaded
-        file: std.fs.File,
-        watch_descriptor: i32,
-    } = null,
     tz: std.tz.Tz,
-
     timer_fd: i32,
 
     fn init(alc: std.mem.Allocator) !DateTime {
@@ -855,63 +730,15 @@ const DateTime = struct {
         var tz = try std.tz.Tz.parse(alc, tzfat.reader());
         errdefer tz.deinit();
 
-        const IN_NONBLOCK = 0o00004000;
-        const ino_file: std.fs.File = .{ .handle = try std.posix.inotify_init1(IN_NONBLOCK) };
-        errdefer ino_file.close();
-
-        const IN_CREATE = 0x00000100; // file created (symlink created)
-        const IN_MOVED_TO = 0x00000080; // file renamed to event.name
-        const mask = IN_CREATE | IN_MOVED_TO;
-        const tz_wd = try std.posix.inotify_add_watch(ino_file.handle, "/etc", mask);
-
         return .{
             .tz = tz,
-            .inotify = .{ .file = ino_file, .watch_descriptor = tz_wd },
             .timer_fd = timer_fd,
         };
     }
 
     fn deinit(self: *DateTime) void {
-        if (self.inotify) |i| i.file.close();
         self.tz.deinit();
         std.posix.close(self.timer_fd);
-    }
-
-    const InotifyEvent = std.os.linux.inotify_event;
-
-    /// returns true if timezone was updated
-    fn maybeUpdateTimezone(self: *DateTime) !bool {
-        const ino = self.inotify.?;
-        var did_update = false;
-        // need to read to a buffer big enough to hold the entire event,
-        // otherwise read returns INVAL
-        var buf: [@sizeOf(InotifyEvent) + std.os.linux.NAME_MAX + 1]u8 = undefined;
-        while (true) {
-            const read_bytes = ino.file.reader().read(&buf) catch |err| switch (err) {
-                error.WouldBlock => return did_update,
-                else => return err,
-            };
-            const event: InotifyEvent = @bitCast(buf[0..@sizeOf(InotifyEvent)].*);
-
-            std.debug.assert(read_bytes == @sizeOf(InotifyEvent) + event.len);
-            if (event.wd == -1) return error.EventQueueOverflowed;
-            std.debug.assert(event.wd == ino.watch_descriptor);
-
-            const name_buf = buf[@sizeOf(InotifyEvent)..][0..event.len];
-
-            const name = "localtime";
-            if (name_buf.len <= name.len or name_buf[name.len] != 0) continue;
-            for (name, 0..) |b, i| if (b != name_buf[i]) continue;
-
-            const tzfat = try std.fs.openFileAbsolute("/etc/localtime", .{});
-            defer tzfat.close();
-
-            const tz = try std.tz.Tz.parse(self.tz.allocator, tzfat.reader());
-            self.tz.deinit();
-            self.tz = tz;
-
-            did_update = true;
-        }
     }
 
     fn getTime(self: DateTime, buf: *[32]u8) []const u8 {
