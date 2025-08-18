@@ -252,8 +252,7 @@ const Daemon = struct {
         errdefer std.fs.deleteFileAbsolute(log_path) catch unreachable;
         errdefer log_file.close();
 
-        var audio = try Audio.init();
-        errdefer audio.deinit();
+        const audio = try Audio.init(alc);
 
         const battery = try Battery.init();
         errdefer if (battery) |b| b.deinit();
@@ -265,6 +264,7 @@ const Daemon = struct {
         errdefer std.posix.close(epoll_fd);
 
         try addToEpoll(epoll_fd, signal_fd);
+        try addToEpoll(epoll_fd, audio.pipe.handle);
         try addToEpoll(epoll_fd, server.stream.handle);
         try addToEpoll(epoll_fd, datetime.timer_fd);
         if (battery) |b| {
@@ -298,7 +298,6 @@ const Daemon = struct {
         d.log_file.close();
 
         std.posix.close(d.epoll_fd);
-        d.audio.deinit();
         if (d.battery) |b| b.deinit();
         d.datetime.deinit();
     }
@@ -325,10 +324,7 @@ const Daemon = struct {
                 // pango markup to have volume struck out when muted
                 "{{\"markup\":\"pango\",\"full_text\": \" ({s}{s}{d:.2}{s}) {s}{s}\"}}],", .{
                 d.message.slice(),
-                switch (d.audio.sink) {
-                    .bluetooth => "bt: ",
-                    .speakers => "",
-                },
+                if (d.audio.bluetooth) "bt: " else "",
                 if (d.audio.muted) "<s>" else "",
                 d.audio.volume,
                 if (d.audio.muted) "</s>" else "",
@@ -345,6 +341,8 @@ const Daemon = struct {
                 } else if (fd == d.server.stream.handle) {
                     const conn = try d.server.accept();
                     try addToEpoll(d.epoll_fd, conn.stream.handle);
+                } else if (fd == d.audio.pipe.handle) {
+                    try d.audio.updateOnce();
                 } else if (fd == d.datetime.timer_fd) {
                     var buf: [8]u8 = undefined;
                     _ = try std.posix.read(d.datetime.timer_fd, &buf); //reset timer
@@ -383,18 +381,46 @@ const Daemon = struct {
 };
 
 const Audio = struct {
-    sink: enum {
-        bluetooth,
-        speakers,
-    },
-    muted: bool,
-    volume: f16,
+    pipe: std.fs.File,
+    child: *std.process.Child,
 
-    fn init() !Audio {
-        return Audio{ .sink = .bluetooth, .muted = true, .volume = 0.3333 };
+    volume: f16,
+    muted: bool,
+    bluetooth: bool,
+
+    fn init(alc: std.mem.Allocator) !Audio {
+        const xdg_data_home = std.posix.getenv("XDG_DATA_HOME") orelse return error.XdgDataNomeNotFound;
+        const script = try std.fs.path.join(alc, &.{ xdg_data_home, "statusbar", "audio-info.lua" });
+        defer alc.free(script);
+        var child = std.process.Child.init(&.{ "wpexec", script }, alc);
+        child.stdout_behavior = .Pipe;
+        try child.spawn();
+        const pipe = child.stdout.?;
+
+        var audio: Audio = .{
+            .pipe = pipe,
+            .child = &child,
+            .volume = undefined,
+            .muted = undefined,
+            .bluetooth = undefined,
+        };
+        try audio.updateOnce();
+        return audio;
     }
-    fn deinit(self: Audio) void {
-        _ = self;
+
+    fn updateOnce(a: *Audio) !void {
+        const bytes = try a.pipe.reader().readBytesNoEof(9);
+        a.volume = try std.fmt.parseFloat(f16, bytes[0..4]);
+        a.muted = switch (bytes[5]) {
+            't' => true,
+            'f' => false,
+            else => unreachable,
+        };
+        a.bluetooth = switch (bytes[7]) {
+            't' => true,
+            'f' => false,
+            else => unreachable,
+        };
     }
 };
 
