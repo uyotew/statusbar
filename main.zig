@@ -389,10 +389,19 @@ const Audio = struct {
     bluetooth: bool,
 
     fn init(alc: std.mem.Allocator) !Audio {
-        const xdg_data_home = std.posix.getenv("XDG_DATA_HOME") orelse return error.XdgDataNomeNotFound;
-        const script = try std.fs.path.join(alc, &.{ xdg_data_home, "statusbar", "audio-info.lua" });
-        defer alc.free(script);
-        var child = std.process.Child.init(&.{ "wpexec", script }, alc);
+        var tmp_rand: [16]u8 = undefined;
+        var tmp_path: [std.fs.base64_encoder.calcSize(16)]u8 = undefined;
+        try std.posix.getrandom(&tmp_rand);
+        _ = std.fs.base64_encoder.encode(&tmp_path, &tmp_rand);
+        @memcpy(tmp_path[0..5], "/tmp/");
+
+        const file = try std.fs.createFileAbsolute(&tmp_path, .{});
+        try file.writeAll(@embedFile("audio-info.lua"));
+        defer {
+            file.close();
+            std.fs.deleteFileAbsolute(&tmp_path) catch {};
+        }
+        var child = std.process.Child.init(&.{ "wpexec", &tmp_path }, alc);
         child.stdout_behavior = .Pipe;
         try child.spawn();
         const pipe = child.stdout.?;
