@@ -110,36 +110,56 @@ pub fn main() !void {
     const socket_path = try std.mem.join(alc, "/", &.{ run_dir, status_socket_name });
     defer alc.free(socket_path);
 
+    const tzfat = try std.fs.openFileAbsolute("/etc/localtime", .{});
+    defer tzfat.close();
+
+    var timezone = try std.tz.Tz.parse(alc, tzfat.reader());
+    defer timezone.deinit();
+
     switch (try Args.parse(args_input)) {
-        .log => try printLog(alc, log_path),
+        .log => try printLog(log_path, timezone),
         .send => |args| try sendOutputToDaemon(alc, args, socket_path),
         .start => {
             var daemon: Daemon = try .init(alc, socket_path, log_path);
             defer daemon.deinit(socket_path, log_path);
-            try daemon.run();
+            try daemon.run(timezone);
         },
     }
 }
 
-fn printLog(alc: std.mem.Allocator, log_path: []const u8) !void {
+fn formatTime(seconds: i64, timezone: std.tz.Tz, buffer: []u8) []const u8 {
+    var i: usize = timezone.transitions.len - 1;
+    const tz_seconds = while (i > 0) : (i -= 1) {
+        const t = timezone.transitions[i];
+        if (seconds > t.ts) break t.timetype.offset + seconds;
+    } else unreachable;
+
+    const ep_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(tz_seconds) };
+    const ep_day = ep_secs.getEpochDay();
+    const year_day = ep_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = ep_secs.getDaySeconds();
+
+    const year = year_day.year;
+    const month = month_day.month.numeric();
+    const day = month_day.day_index + 1;
+    // 1970-1-1 was a thursday
+    const day_name_idx = (ep_day.day + 3) % 7;
+    const day_name = ([_][]const u8{ "Mon", "Tue", "Wen", "Thu", "Fri", "Sat", "Sun" })[day_name_idx];
+    const hour = day_secs.getHoursIntoDay();
+    const minute = day_secs.getMinutesIntoHour();
+
+    const fmt = "{:0>4}-{:0>2}-{:0>2} {s} {:0>2}:{:0>2}";
+    const arg = .{ year, month, day, day_name, hour, minute };
+    return std.fmt.bufPrint(buffer, fmt, arg) catch unreachable;
+}
+
+fn printLog(log_path: []const u8, timezone: std.tz.Tz) !void {
     const log_file = std.fs.openFileAbsolute(log_path, .{}) catch |err| switch (err) {
         error.FileNotFound => fatal("could not find log-file: {s}, it is usually available as long as the daemon is running", .{log_path}),
         else => return err,
     };
     defer log_file.close();
-
-    const tzfat = try std.fs.openFileAbsolute("/etc/localtime", .{});
-    defer tzfat.close();
-
-    var tz = try std.tz.Tz.parse(alc, tzfat.reader());
-    defer tz.deinit();
-
-    var i: usize = tz.transitions.len - 1;
-    const current_timestamp = std.time.timestamp();
-    const offset_secs = while (i > 0) : (i -= 1) {
-        const t = tz.transitions[i];
-        if (current_timestamp > t.ts) break t.timetype.offset;
-    } else unreachable;
 
     const w = std.io.getStdOut().writer();
     const r = log_file.reader();
@@ -148,24 +168,8 @@ fn printLog(alc: std.mem.Allocator, log_path: []const u8) !void {
             error.EndOfStream => return,
             else => return err,
         });
-
-        const ep_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(log_timestamp + offset_secs) };
-        const ep_day = ep_secs.getEpochDay();
-        const year_day = ep_day.calculateYearDay();
-        const month_day = year_day.calculateMonthDay();
-        const day_secs = ep_secs.getDaySeconds();
-
-        const year = year_day.year;
-        const month = month_day.month.numeric();
-        const day = month_day.day_index + 1;
-        const hour = day_secs.getHoursIntoDay();
-        const minute = day_secs.getMinutesIntoHour();
-        const second = day_secs.getSecondsIntoMinute();
-
-        const fmt = "[{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}]  ";
-        const arg = .{ year, month, day, hour, minute, second };
-        try w.print(fmt, arg);
-
+        var buf: [32]u8 = undefined;
+        try w.print("[{s}] ", .{formatTime(log_timestamp, timezone, &buf)});
         try r.streamUntilDelimiter(w, '\n', 516);
         try w.writeByte('\n');
     }
@@ -219,9 +223,8 @@ const Daemon = struct {
     log_file: std.fs.File,
     epoll_fd: i32,
     message: std.BoundedArray(u8, 256) = .{},
-    audio: Audio,
     datetime: DateTime,
-    time: std.BoundedArray(u8, 32) = .{},
+    audio: Audio,
     battery: ?Battery,
 
     fn init(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8) !Daemon {
@@ -257,7 +260,7 @@ const Daemon = struct {
         const battery = try Battery.init();
         errdefer if (battery) |b| b.deinit();
 
-        var datetime = try DateTime.init(alc);
+        var datetime = try DateTime.init();
         errdefer datetime.deinit();
 
         const epoll_fd = try std.posix.epoll_create1(0);
@@ -302,7 +305,7 @@ const Daemon = struct {
         d.datetime.deinit();
     }
 
-    fn run(d: *Daemon) !void {
+    fn run(d: *Daemon, timezone: std.tz.Tz) !void {
         const wait_max_events = 16;
         var events: [wait_max_events]std.os.linux.epoll_event = undefined;
 
@@ -329,7 +332,7 @@ const Daemon = struct {
                 d.audio.volume,
                 if (d.audio.muted) "</s>" else "",
                 battery_msg,
-                d.time.slice(),
+                d.datetime.currentFormattedTime(timezone),
             });
 
             const n_fds = std.posix.epoll_wait(d.epoll_fd, &events, -1);
@@ -346,7 +349,6 @@ const Daemon = struct {
                 } else if (fd == d.datetime.timer_fd) {
                     var buf: [8]u8 = undefined;
                     _ = try std.posix.read(d.datetime.timer_fd, &buf); //reset timer
-                    d.time.len = d.datetime.getTime(&d.time.buffer).len;
                 } else if (d.battery != null and fd == d.battery.?.ac_netlink.sock.handle) {
                     d.battery.?.ac_status = try d.battery.?.ac_netlink.getAcStatus() orelse continue;
                 } else if (d.battery != null and fd == d.battery.?.timer_fd) {
@@ -742,10 +744,10 @@ const Battery = struct {
 };
 
 const DateTime = struct {
-    tz: std.tz.Tz,
     timer_fd: i32,
+    time_buf: [32]u8,
 
-    fn init(alc: std.mem.Allocator) !DateTime {
+    fn init() !DateTime {
         const timer_fd = try std.posix.timerfd_create(std.os.linux.TIMERFD_CLOCK.REALTIME, .{});
         errdefer std.posix.close(timer_fd);
 
@@ -759,50 +761,18 @@ const DateTime = struct {
             .it_interval = .{ .sec = 60, .nsec = 0 },
         }, null);
 
-        const tzfat = try std.fs.openFileAbsolute("/etc/localtime", .{});
-        defer tzfat.close();
-
-        var tz = try std.tz.Tz.parse(alc, tzfat.reader());
-        errdefer tz.deinit();
-
         return .{
-            .tz = tz,
             .timer_fd = timer_fd,
+            .time_buf = undefined,
         };
     }
 
-    fn deinit(self: *DateTime) void {
-        self.tz.deinit();
-        std.posix.close(self.timer_fd);
+    fn deinit(dt: *DateTime) void {
+        std.posix.close(dt.timer_fd);
     }
 
-    fn getTime(self: DateTime, buf: *[32]u8) []const u8 {
+    fn currentFormattedTime(dt: *DateTime, timezone: std.tz.Tz) []const u8 {
         const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        const timestamp_secs = ts.sec;
-
-        var i: usize = self.tz.transitions.len - 1;
-        const tz_seconds = while (i > 0) : (i -= 1) {
-            const t = self.tz.transitions[i];
-            if (timestamp_secs > t.ts) break t.timetype.offset + timestamp_secs;
-        } else unreachable;
-
-        const ep_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(tz_seconds) };
-        const ep_day = ep_secs.getEpochDay();
-        const year_day = ep_day.calculateYearDay();
-        const month_day = year_day.calculateMonthDay();
-        const day_secs = ep_secs.getDaySeconds();
-
-        const year = year_day.year;
-        const month = month_day.month.numeric();
-        const day = month_day.day_index + 1;
-        // 1970-1-1 was a thursday
-        const day_name_idx = (ep_day.day + 3) % 7;
-        const day_name = ([_][]const u8{ "Mon", "Tue", "Wen", "Thu", "Fri", "Sat", "Sun" })[day_name_idx];
-        const hour = day_secs.getHoursIntoDay();
-        const minute = day_secs.getMinutesIntoHour();
-
-        const fmt = "{:0>4}-{:0>2}-{:0>2} {s} {:0>2}:{:0>2}";
-        const arg = .{ year, month, day, day_name, hour, minute };
-        return std.fmt.bufPrint(buf, fmt, arg) catch unreachable;
+        return formatTime(ts.sec, timezone, &dt.time_buf);
     }
 };
