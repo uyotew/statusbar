@@ -122,7 +122,8 @@ pub fn main() !void {
         .log => try printLog(log_path, timezone),
         .send => |args| try sendOutputToDaemon(alc, args, socket_path),
         .start => {
-            var daemon: Daemon = try .init(alc, socket_path, log_path);
+            var log_buf: [1024]u8 = undefined;
+            var daemon: Daemon = try .init(alc, socket_path, log_path, &log_buf);
             defer daemon.deinit(socket_path, log_path);
             try daemon.run(timezone);
         },
@@ -222,24 +223,17 @@ const Daemon = struct {
     alc: std.mem.Allocator,
     signal_fd: std.posix.fd_t,
     server: std.net.Server,
-    log_file: std.fs.File,
+    log_writer: std.fs.File.Writer,
     epoll_fd: i32,
-    message: std.BoundedArray(u8, 256) = .{},
+    message: std.ArrayList(u8) = .empty,
     datetime: DateTime,
     audio: Audio,
     battery: ?Battery,
 
-    fn init(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8) !Daemon {
-        // handle common signals, so temporary files (log and socket) get
-        // removed when the process gets terminated (most of the time)
-        // usually, the process isn't supposed to terminate until you power off though
-        // but sending these signals is the only way to shut down the daemon as well
-        // mostly debugging convenience
-        // but also helpful when reloading the sway config?
-        // TODO: check if true
-        var mask = std.posix.empty_sigset;
-        std.os.linux.sigaddset(&mask, std.os.linux.SIG.INT);
-        std.os.linux.sigaddset(&mask, std.os.linux.SIG.TERM);
+    fn init(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8, log_buf: []const u8) !Daemon {
+        var mask = std.posix.sigemptyset();
+        std.posix.sigaddset(&mask, std.os.linux.SIG.INT);
+        std.posix.sigaddset(&mask, std.os.linux.SIG.TERM);
         std.posix.sigprocmask(std.os.linux.SIG.BLOCK, &mask, null);
 
         const signal_fd = try std.posix.signalfd(-1, &mask, 0);
@@ -252,10 +246,6 @@ const Daemon = struct {
         };
         errdefer server.deinit();
         errdefer std.fs.deleteFileAbsolute(socket_path) catch unreachable;
-
-        const log_file = try std.fs.createFileAbsolute(log_path, .{});
-        errdefer std.fs.deleteFileAbsolute(log_path) catch unreachable;
-        errdefer log_file.close();
 
         const audio = try Audio.init(alc);
 
@@ -277,11 +267,15 @@ const Daemon = struct {
             try addToEpoll(epoll_fd, b.timer_fd);
         }
 
+        const log_file = try std.fs.createFileAbsolute(log_path, .{});
+        errdefer std.fs.deleteFileAbsolute(log_path) catch unreachable;
+        errdefer log_file.close();
+
         return .{
             .alc = alc,
             .signal_fd = signal_fd,
             .server = server,
-            .log_file = log_file,
+            .log_writer = log_file.writer(log_buf),
             .epoll_fd = epoll_fd,
             .audio = audio,
             .datetime = datetime,
@@ -297,10 +291,11 @@ const Daemon = struct {
     fn deinit(d: *Daemon, socket_path: []const u8, log_path: []const u8) void {
         std.posix.close(d.signal_fd);
         d.server.deinit();
+        d.message.deinit(d.alc);
 
         std.fs.deleteFileAbsolute(socket_path) catch unreachable;
         std.fs.deleteFileAbsolute(log_path) catch unreachable;
-        d.log_file.close();
+        d.log_writer.file.close();
 
         std.posix.close(d.epoll_fd);
         if (d.battery) |b| b.deinit();
@@ -311,73 +306,78 @@ const Daemon = struct {
         const wait_max_events = 16;
         var events: [wait_max_events]std.os.linux.epoll_event = undefined;
 
-        const w = std.io.getStdOut().writer();
+        var write_buf: [516]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&write_buf);
+        const stdout = &stdout_writer.interface;
         // header for swaybar-protocol
-        try w.writeAll("{\"version\":1}\n[");
+        try stdout.writeAll("{\"version\":1}\n[");
 
         while (true) {
-            var battery_buf: [8]u8 = undefined;
-            const battery_msg = if (d.battery) |b| try std.fmt.bufPrint(&battery_buf, "{s}[{}%] ", .{
-                switch (b.ac_status) {
-                    .online => "^",
-                    .offline => "",
-                    .unknown => "?",
-                },
-                b.capacity,
-            }) else "";
-            try w.print("[{{\"full_text\":\"{s} \"}}," ++
-                // pango markup to have volume struck out when muted
-                "{{\"markup\":\"pango\",\"full_text\": \" ({s}{s}{d:.2}{s}) {s}{s}\"}}],", .{
-                d.message.slice(),
+            try stdout.print("[{{\"full_text\":\"{s} \"}},", .{d.message.slice()});
+            // pango markup to have volume struck out when muted
+            try stdout.writeAll("{{\"markup\":\"pango\",\"full_text\": \" ");
+            try stdout.print("({s}{s}{d:.2}{s}) ", .{
                 if (d.audio.bluetooth) "bt: " else "",
                 if (d.audio.muted) "<s>" else "",
                 d.audio.volume,
                 if (d.audio.muted) "</s>" else "",
-                battery_msg,
-                d.datetime.currentFormattedTime(timezone),
             });
+            if (d.battery) |bat| {
+                try stdout.print("{s}[{}%]", .{
+                    switch (bat.ac_status) {
+                        .online => "^",
+                        .offline => "",
+                        .unknown => "?",
+                    },
+                    bat.capacity,
+                });
+            }
+            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            writeTime(stdout, ts.sec, timezone);
+            try stdout.writeAll("\"}}],");
+            try stdout.flush();
 
             const n_fds = std.posix.epoll_wait(d.epoll_fd, &events, -1);
+            var trash_buf: [8]u8 = undefined;
             for (events[0..n_fds]) |ev| {
                 const fd = ev.data.fd;
                 if (fd == d.signal_fd) {
-                    // exit when recieving int or term signals
-                    return;
+                    return; // exit cleanly when recieving int or term signals
                 } else if (fd == d.server.stream.handle) {
                     const conn = try d.server.accept();
                     try addToEpoll(d.epoll_fd, conn.stream.handle);
                 } else if (fd == d.audio.pipe.handle) {
                     try d.audio.updateOnce();
                 } else if (fd == d.datetime.timer_fd) {
-                    var buf: [8]u8 = undefined;
-                    _ = try std.posix.read(d.datetime.timer_fd, &buf); //reset timer
+                    _ = try std.posix.read(d.datetime.timer_fd, &trash_buf); //reset timer
                 } else if (d.battery != null and fd == d.battery.?.ac_netlink.sock.handle) {
                     d.battery.?.ac_status = try d.battery.?.ac_netlink.getAcStatus() orelse continue;
                 } else if (d.battery != null and fd == d.battery.?.timer_fd) {
-                    var buf: [8]u8 = undefined;
-                    _ = try std.posix.read(d.battery.?.timer_fd, &buf); //reset timer
+                    _ = try std.posix.read(d.battery.?.timer_fd, &trash_buf); //reset timer
                     d.battery.?.capacity = try Battery.getNewCapacity(d.battery.?.cap_files);
                 } else {
-                    // handle messages from connection accepted earlier
-                    var fbs = std.io.fixedBufferStream(&d.message.buffer);
-                    const reader = (std.net.Stream{ .handle = fd }).reader();
+                    if (d.message.capacity > 1024) try d.message.resize(d.alc, 1024);
+                    var msg_writer: std.Io.Writer.Allocating = .fromArrayList(d.alc, &d.message);
+                    const msg = msg_writer.writer;
+                    // handle messages from connections accepted earlier (from fd)
+                    // reuse write_buf
+                    var conn_reader = (std.net.Stream{ .handle = fd }).reader(&write_buf);
+                    const conn = &conn_reader.interface;
                     // this will not block long, since every message sent by the sender
                     // has to end in a newline, and is sent in full
-                    reader.streamUntilDelimiter(fbs.writer(), '\n', fbs.buffer.len) catch |err| switch (err) {
+                    conn.streamDelimiter(msg, '\n') catch |err| switch (err) {
                         error.EndOfStream => {
                             const EPOLL = std.os.linux.EPOLL;
                             try std.posix.epoll_ctl(d.epoll_fd, EPOLL.CTL_DEL, fd, null);
                             std.posix.close(fd);
-                            continue;
                         },
                         else => return err,
                     };
-                    d.message.len = fbs.pos;
-                    // logging
-                    const timestamp = std.time.timestamp();
-                    try d.log_file.writeAll(&std.mem.toBytes(timestamp));
-                    try d.log_file.writeAll(d.message.slice());
-                    try d.log_file.writeAll("\n");
+                    d.message = msg_writer.toArrayList();
+
+                    const log = &d.log_writer.interface;
+                    try log.writeInt(i64, std.time.timestamp(), .little);
+                    try log.print("{s}\n", .{d.message.slice()});
                 }
             }
         }
@@ -747,7 +747,6 @@ const Battery = struct {
 
 const DateTime = struct {
     timer_fd: i32,
-    time_buf: [32]u8,
 
     fn init() !DateTime {
         const timer_fd = try std.posix.timerfd_create(std.os.linux.TIMERFD_CLOCK.REALTIME, .{});
@@ -765,16 +764,10 @@ const DateTime = struct {
 
         return .{
             .timer_fd = timer_fd,
-            .time_buf = undefined,
         };
     }
 
     fn deinit(dt: *DateTime) void {
         std.posix.close(dt.timer_fd);
-    }
-
-    fn currentFormattedTime(dt: *DateTime, timezone: Tz) []const u8 {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        return formatTime(ts.sec, timezone, &dt.time_buf);
     }
 };
