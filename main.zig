@@ -101,10 +101,9 @@ pub fn main() !void {
     const args_input = try std.process.argsAlloc(alc);
     defer std.process.argsFree(alc, args_input);
 
-    var env_map = try std.process.getEnvMap(alc);
-    defer env_map.deinit();
+    const run_dir = std.posix.getenv("XDG_RUNTIME_DIR") orelse fatal("XDG_RUNTIME_DIR not in env", .{});
+    if (run_dir.len == 0) fatal("XDG_RUNTIME_DIR is an empty string", .{});
 
-    const run_dir = env_map.get("XDG_RUNTIME_DIR") orelse fatal("XDG_RUNTIME_DIR not in env", .{});
     const log_path = try std.mem.join(alc, "/", &.{ run_dir, log_file_name });
     defer alc.free(log_path);
     const socket_path = try std.mem.join(alc, "/", &.{ run_dir, status_socket_name });
