@@ -129,7 +129,7 @@ pub fn main() !void {
     }
 }
 
-fn formatTime(seconds: i64, timezone: Tz, buffer: []u8) []const u8 {
+fn writeTime(writer: *std.Io.Writer, seconds: i64, timezone: Tz) !void {
     var i: usize = timezone.transitions.len - 1;
     const tz_seconds = while (i > 0) : (i -= 1) {
         const t = timezone.transitions[i];
@@ -153,7 +153,7 @@ fn formatTime(seconds: i64, timezone: Tz, buffer: []u8) []const u8 {
 
     const fmt = "{:0>4}-{:0>2}-{:0>2} {s} {:0>2}:{:0>2}";
     const arg = .{ year, month, day, day_name, hour, minute };
-    return std.fmt.bufPrint(buffer, fmt, arg) catch unreachable;
+    return writer.print(fmt, arg);
 }
 
 fn printLog(log_path: []const u8, timezone: Tz) !void {
@@ -163,17 +163,23 @@ fn printLog(log_path: []const u8, timezone: Tz) !void {
     };
     defer log_file.close();
 
-    const w = std.io.getStdOut().writer();
-    const r = log_file.reader();
-    while (true) {
-        const log_timestamp: i64 = @bitCast(r.readBytesNoEof(@sizeOf(i64)) catch |err| switch (err) {
-            error.EndOfStream => return,
-            else => return err,
-        });
-        var buf: [32]u8 = undefined;
-        try w.print("[{s}] ", .{formatTime(log_timestamp, timezone, &buf)});
-        try r.streamUntilDelimiter(w, '\n', 516);
-        try w.writeByte('\n');
+    var reader_buf: [4096]u8 = undefined;
+    var log_reader = log_file.reader(&reader_buf);
+    const log = &log_reader.interface;
+
+    var writer_buf: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&writer_buf);
+    const stdout = &stdout_writer.interface;
+
+    while (log.takeInt(i64, .little)) |line_timestamp| {
+        try stdout.writeAll("[");
+        try writeTime(stdout, line_timestamp, timezone);
+        try stdout.writeAll("] ");
+        _ = try log.streamDelimiter(stdout, '\n');
+        try stdout.writeAll("\n");
+    } else |err| switch (err) {
+        error.EndOfStream => try stdout.flush(),
+        else => return err,
     }
 }
 
