@@ -230,7 +230,7 @@ const Daemon = struct {
     audio: Audio,
     battery: ?Battery,
 
-    fn init(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8, log_buf: []const u8) !Daemon {
+    fn init(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8, log_buf: []u8) !Daemon {
         var mask = std.posix.sigemptyset();
         std.posix.sigaddset(&mask, std.os.linux.SIG.INT);
         std.posix.sigaddset(&mask, std.os.linux.SIG.TERM);
@@ -247,7 +247,7 @@ const Daemon = struct {
         errdefer server.deinit();
         errdefer std.fs.deleteFileAbsolute(socket_path) catch unreachable;
 
-        const audio = try Audio.init(alc);
+        var audio = try Audio.init(alc);
         errdefer _ = audio.deinit() catch unreachable;
 
         const battery = try Battery.init();
@@ -313,7 +313,7 @@ const Daemon = struct {
         try stdout.writeAll("{\"version\":1}\n[");
 
         while (true) {
-            try stdout.print("[{{\"full_text\":\"{s} \"}},", .{d.message.slice()});
+            try stdout.print("[{{\"full_text\":\"{s} \"}},", .{d.message.items});
             // pango markup to have volume struck out when muted
             try stdout.writeAll("{{\"markup\":\"pango\",\"full_text\": \" ");
             try stdout.print("({s}{s}{d:.2}{s}) ", .{
@@ -333,7 +333,7 @@ const Daemon = struct {
                 });
             }
             const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-            writeTime(stdout, ts.sec, timezone);
+            try writeTime(stdout, ts.sec, timezone);
             try stdout.writeAll("\"}}],");
             try stdout.flush();
 
@@ -346,7 +346,7 @@ const Daemon = struct {
                 } else if (fd == d.server.stream.handle) {
                     const conn = try d.server.accept();
                     try addToEpoll(d.epoll_fd, conn.stream.handle);
-                } else if (fd == d.audio.pipe.handle) {
+                } else if (fd == d.audio.cmd.stdout.?.handle) {
                     try d.audio.updateOnce();
                 } else if (fd == d.datetime.timer_fd) {
                     _ = try std.posix.read(d.datetime.timer_fd, &trash_buf); //reset timer
@@ -358,14 +358,14 @@ const Daemon = struct {
                 } else {
                     if (d.message.capacity > 1024) try d.message.resize(d.alc, 1024);
                     var msg_writer: std.Io.Writer.Allocating = .fromArrayList(d.alc, &d.message);
-                    const msg = msg_writer.writer;
+                    const msg = &msg_writer.writer;
                     // handle messages from connections accepted earlier (from fd)
                     // reuse write_buf
                     var conn_reader = (std.net.Stream{ .handle = fd }).reader(&write_buf);
-                    const conn = &conn_reader.interface;
+                    const conn = conn_reader.interface();
                     // this will not block long, since every message sent by the sender
                     // has to end in a newline, and is sent in full
-                    conn.streamDelimiter(msg, '\n') catch |err| switch (err) {
+                    _ = conn.streamDelimiter(msg, '\n') catch |err| switch (err) {
                         error.EndOfStream => {
                             const EPOLL = std.os.linux.EPOLL;
                             try std.posix.epoll_ctl(d.epoll_fd, EPOLL.CTL_DEL, fd, null);
@@ -377,7 +377,7 @@ const Daemon = struct {
 
                     const log = &d.log_writer.interface;
                     try log.writeInt(i64, std.time.timestamp(), .little);
-                    try log.print("{s}\n", .{d.message.slice()});
+                    try log.print("{s}\n", .{d.message.items});
                     try log.flush();
                 }
             }
@@ -438,6 +438,33 @@ const Audio = struct {
             else => unreachable,
         };
         cmd.toss(1); // skip newline;
+    }
+};
+
+const DateTime = struct {
+    timer_fd: i32,
+
+    fn init() !DateTime {
+        const timer_fd = try std.posix.timerfd_create(std.os.linux.TIMERFD_CLOCK.REALTIME, .{});
+        errdefer std.posix.close(timer_fd);
+
+        var time_spec = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        //set timespec to last full minute
+        time_spec.sec -= @mod(time_spec.sec, 60);
+        time_spec.nsec = 0;
+
+        try std.posix.timerfd_settime(timer_fd, .{ .ABSTIME = true }, &.{
+            .it_value = time_spec,
+            .it_interval = .{ .sec = 60, .nsec = 0 },
+        }, null);
+
+        return .{
+            .timer_fd = timer_fd,
+        };
+    }
+
+    fn deinit(dt: *DateTime) void {
+        std.posix.close(dt.timer_fd);
     }
 };
 
@@ -747,31 +774,4 @@ const Battery = struct {
             }
         };
     };
-};
-
-const DateTime = struct {
-    timer_fd: i32,
-
-    fn init() !DateTime {
-        const timer_fd = try std.posix.timerfd_create(std.os.linux.TIMERFD_CLOCK.REALTIME, .{});
-        errdefer std.posix.close(timer_fd);
-
-        var time_spec = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        //set timespec to last full minute
-        time_spec.sec -= @mod(time_spec.sec, 60);
-        time_spec.nsec = 0;
-
-        try std.posix.timerfd_settime(timer_fd, .{ .ABSTIME = true }, &.{
-            .it_value = time_spec,
-            .it_interval = .{ .sec = 60, .nsec = 0 },
-        }, null);
-
-        return .{
-            .timer_fd = timer_fd,
-        };
-    }
-
-    fn deinit(dt: *DateTime) void {
-        std.posix.close(dt.timer_fd);
-    }
 };
