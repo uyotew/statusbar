@@ -184,44 +184,38 @@ fn printLog(log_path: []const u8, timezone: Tz) !void {
 }
 
 fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []const u8) !void {
-    const cmd = try std.mem.join(alc, " ", args.cmd);
-    defer alc.free(cmd);
+    const cmd_line = try std.mem.join(alc, " ", args.cmd);
+    defer alc.free(cmd_line);
 
-    const stream = std.net.connectUnixSocket(socket_path) catch |err| switch (err) {
+    const unix_sock = std.net.connectUnixSocket(socket_path) catch |err| switch (err) {
         error.FileNotFound => fatal("cannot connect to daemon, make sure it is started with --start", .{}),
         else => return err,
     };
-    defer stream.close();
+    defer unix_sock.close();
 
-    var child = std.process.Child.init(&.{ "sh", "-c", cmd }, alc);
-    child.stdout_behavior = .Pipe;
-    try child.spawn();
-    const child_out = child.stdout.?.reader();
+    var write_buf: [256]u8 = undefined;
+    var unix_sock_writer = unix_sock.writer(&write_buf);
+    const daemon = &unix_sock_writer.interface;
 
-    var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var cmd = std.process.Child.init(&.{ "sh", "-c", cmd_line }, alc);
+    cmd.stdout_behavior = .Pipe;
+    try cmd.spawn();
+    var read_buf: [256]u8 = undefined;
+    var cmd_out_reader = cmd.stdout.?.reader(&read_buf);
+    const cmd_out = &cmd_out_reader.interface;
 
-    const max_len = 256;
-    const prefix_len = if (args.name) |n| (try std.fmt.bufPrint(&buf, "{s}: ", .{n})).len else 0;
-    if (prefix_len >= max_len) fatal("command name too long", .{});
-
-    while (true) {
-        fbs.pos = prefix_len;
-
-        child_out.streamUntilDelimiter(fbs.writer(), '\n', max_len - prefix_len) catch |err| switch (err) {
-            error.EndOfStream => break,
-            error.StreamTooLong => {},
-            else => return err,
-        };
-        try fbs.writer().writeAll("\n");
-        try stream.writeAll(fbs.getWritten());
+    if (args.name) |cmd_name| try daemon.print("{s}: ", .{cmd_name});
+    while (cmd_out.streamDelimiter(daemon, '\n')) |_| {
+        try daemon.writeAll("\n");
+        try daemon.flush();
+    } else |err| switch (err) {
+        error.EndOfStream => {
+            try daemon.writeAll("\n");
+            try daemon.flush();
+        },
+        else => return err,
     }
-    // on end of stream, send last output, even if it doesnt end with \n
-    if (fbs.pos > prefix_len) {
-        if (fbs.buffer[fbs.pos - 1] != '\n') try fbs.writer().writeAll("\n");
-        try stream.writeAll(fbs.getWritten());
-    }
-    _ = try child.wait();
+    _ = try cmd.wait();
 }
 
 const Daemon = struct {
