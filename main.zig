@@ -378,6 +378,7 @@ const Daemon = struct {
                     const log = &d.log_writer.interface;
                     try log.writeInt(i64, std.time.timestamp(), .little);
                     try log.print("{s}\n", .{d.message.slice()});
+                    try log.flush();
                 }
             }
         }
