@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Tz = @import("tz.zig").Tz;
 
 const fatal = std.process.fatal;
 
@@ -109,10 +110,12 @@ pub fn main() !void {
     const socket_path = try std.mem.join(alc, "/", &.{ run_dir, status_socket_name });
     defer alc.free(socket_path);
 
-    const tzfat = try std.fs.openFileAbsolute("/etc/localtime", .{});
-    defer tzfat.close();
+    const tzfile = try std.fs.openFileAbsolute("/etc/localtime", .{});
+    defer tzfile.close();
 
-    var timezone = try std.tz.Tz.parse(alc, tzfat.reader());
+    var read_buf: [4096]u8 = undefined;
+    var tz_reader = tzfile.reader(&read_buf);
+    var timezone = try Tz.parse(alc, &tz_reader.interface);
     defer timezone.deinit();
 
     switch (try Args.parse(args_input)) {
@@ -126,7 +129,7 @@ pub fn main() !void {
     }
 }
 
-fn formatTime(seconds: i64, timezone: std.tz.Tz, buffer: []u8) []const u8 {
+fn formatTime(seconds: i64, timezone: Tz, buffer: []u8) []const u8 {
     var i: usize = timezone.transitions.len - 1;
     const tz_seconds = while (i > 0) : (i -= 1) {
         const t = timezone.transitions[i];
@@ -153,7 +156,7 @@ fn formatTime(seconds: i64, timezone: std.tz.Tz, buffer: []u8) []const u8 {
     return std.fmt.bufPrint(buffer, fmt, arg) catch unreachable;
 }
 
-fn printLog(log_path: []const u8, timezone: std.tz.Tz) !void {
+fn printLog(log_path: []const u8, timezone: Tz) !void {
     const log_file = std.fs.openFileAbsolute(log_path, .{}) catch |err| switch (err) {
         error.FileNotFound => fatal("could not find log-file: {s}, it is usually available as long as the daemon is running", .{log_path}),
         else => return err,
@@ -304,7 +307,7 @@ const Daemon = struct {
         d.datetime.deinit();
     }
 
-    fn run(d: *Daemon, timezone: std.tz.Tz) !void {
+    fn run(d: *Daemon, timezone: Tz) !void {
         const wait_max_events = 16;
         var events: [wait_max_events]std.os.linux.epoll_event = undefined;
 
@@ -770,7 +773,7 @@ const DateTime = struct {
         std.posix.close(dt.timer_fd);
     }
 
-    fn currentFormattedTime(dt: *DateTime, timezone: std.tz.Tz) []const u8 {
+    fn currentFormattedTime(dt: *DateTime, timezone: Tz) []const u8 {
         const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
         return formatTime(ts.sec, timezone, &dt.time_buf);
     }
