@@ -15,13 +15,11 @@ Core.require_api("default-nodes","mixer", function(default_nodes,mixer)
   function print_info()
     local id = default_nodes:call("get-default-node","Audio/Sink")
     local volume = mixer:call("get-volume",id)
-
-    print(string.sub(tostring(volume.volume),1,4))
-    if volume.mute then print('t') else print('f') end
+    local volume_str = string.sub(tostring(volume.volume),1,4)
 
     local node = bt_om:lookup{Constraint {"object.id", "=", id}}
     -- if node is found, bluetooth is used
-    if node ~= nil then print('t') else print('f') end
+    print(volume_str .. (volume.mute and 't' or 'f') .. (node ~= nil and 't' or 'f'))
   end
 
   print_info()

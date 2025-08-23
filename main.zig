@@ -248,6 +248,7 @@ const Daemon = struct {
         errdefer std.fs.deleteFileAbsolute(socket_path) catch unreachable;
 
         const audio = try Audio.init(alc);
+        errdefer _ = audio.deinit() catch unreachable;
 
         const battery = try Battery.init();
         errdefer if (battery) |b| b.deinit();
@@ -259,7 +260,7 @@ const Daemon = struct {
         errdefer std.posix.close(epoll_fd);
 
         try addToEpoll(epoll_fd, signal_fd);
-        try addToEpoll(epoll_fd, audio.pipe.handle);
+        try addToEpoll(epoll_fd, audio.cmd.stdout.?.handle);
         try addToEpoll(epoll_fd, server.stream.handle);
         try addToEpoll(epoll_fd, datetime.timer_fd);
         if (battery) |b| {
@@ -290,16 +291,15 @@ const Daemon = struct {
 
     fn deinit(d: *Daemon, socket_path: []const u8, log_path: []const u8) void {
         std.posix.close(d.signal_fd);
-        d.server.deinit();
+        std.posix.close(d.epoll_fd);
+        d.log_writer.file.close();
         d.message.deinit(d.alc);
-
+        d.server.deinit();
+        d.datetime.deinit();
+        if (d.battery) |bat| bat.deinit();
         std.fs.deleteFileAbsolute(socket_path) catch unreachable;
         std.fs.deleteFileAbsolute(log_path) catch unreachable;
-        d.log_writer.file.close();
-
-        std.posix.close(d.epoll_fd);
-        if (d.battery) |b| b.deinit();
-        d.datetime.deinit();
+        _ = d.audio.deinit() catch unreachable;
     }
 
     fn run(d: *Daemon, timezone: Tz) !void {
@@ -386,9 +386,7 @@ const Daemon = struct {
 };
 
 const Audio = struct {
-    pipe: std.fs.File,
-    child: *std.process.Child,
-
+    cmd: std.process.Child,
     volume: f16,
     muted: bool,
     bluetooth: bool,
@@ -400,20 +398,18 @@ const Audio = struct {
         _ = std.fs.base64_encoder.encode(&tmp_path, &tmp_rand);
         @memcpy(tmp_path[0..5], "/tmp/");
 
-        const file = try std.fs.createFileAbsolute(&tmp_path, .{});
-        try file.writeAll(@embedFile("audio-info.lua"));
+        var script_writer = (try std.fs.createFileAbsolute(&tmp_path, .{})).writer(&.{});
+        try script_writer.interface.writeAll(@embedFile("audio-info.lua"));
         defer {
-            file.close();
+            script_writer.file.close();
             std.fs.deleteFileAbsolute(&tmp_path) catch {};
         }
-        var child = std.process.Child.init(&.{ "wpexec", &tmp_path }, alc);
-        child.stdout_behavior = .Pipe;
-        try child.spawn();
-        const pipe = child.stdout.?;
+        var cmd = std.process.Child.init(&.{ "wpexec", &tmp_path }, alc);
+        cmd.stdout_behavior = .Pipe;
+        try cmd.spawn();
 
         var audio: Audio = .{
-            .pipe = pipe,
-            .child = &child,
+            .cmd = cmd,
             .volume = undefined,
             .muted = undefined,
             .bluetooth = undefined,
@@ -422,19 +418,26 @@ const Audio = struct {
         return audio;
     }
 
+    fn deinit(a: *Audio) !std.process.Child.Term {
+        return a.cmd.kill();
+    }
+
     fn updateOnce(a: *Audio) !void {
-        const bytes = try a.pipe.reader().readBytesNoEof(9);
-        a.volume = try std.fmt.parseFloat(f16, bytes[0..4]);
-        a.muted = switch (bytes[5]) {
+        var read_buf: [8]u8 = undefined;
+        var cmd_reader = a.cmd.stdout.?.reader(&read_buf);
+        const cmd = &cmd_reader.interface;
+        a.volume = try std.fmt.parseFloat(f16, try cmd.take(4));
+        a.muted = switch (try cmd.takeByte()) {
             't' => true,
             'f' => false,
             else => unreachable,
         };
-        a.bluetooth = switch (bytes[7]) {
+        a.bluetooth = switch (try cmd.takeByte()) {
             't' => true,
             'f' => false,
             else => unreachable,
         };
+        cmd.toss(1); // skip newline;
     }
 };
 
