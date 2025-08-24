@@ -1,4 +1,3 @@
-
 -- wireplumber script monitoring 
 -- volume  |  mute  |  if bluetooth is useed
 
