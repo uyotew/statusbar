@@ -235,14 +235,6 @@ const Daemon = struct {
     battery: ?Battery,
 
     fn init(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8, log_buf: []u8) !Daemon {
-        var mask = std.posix.sigemptyset();
-        std.posix.sigaddset(&mask, std.os.linux.SIG.INT);
-        std.posix.sigaddset(&mask, std.os.linux.SIG.TERM);
-        std.posix.sigprocmask(std.os.linux.SIG.BLOCK, &mask, null);
-
-        const signal_fd = try std.posix.signalfd(-1, &mask, 0);
-        errdefer std.posix.close(signal_fd);
-
         const addr = try std.net.Address.initUnix(socket_path);
         var server = addr.listen(.{}) catch |err| switch (err) {
             error.AddressInUse => fatal("daemon already running, or previous socket ({s}) was not removed", .{socket_path}),
@@ -253,6 +245,16 @@ const Daemon = struct {
 
         var audio = try Audio.init(alc);
         errdefer _ = audio.deinit() catch unreachable;
+
+        // apply signalmask after launching the audio child process, so
+        // it doesn't inherit it, and fails to catch SIGTERM
+        var mask = std.posix.sigemptyset();
+        std.posix.sigaddset(&mask, std.os.linux.SIG.INT);
+        std.posix.sigaddset(&mask, std.os.linux.SIG.TERM);
+        std.posix.sigprocmask(std.os.linux.SIG.BLOCK, &mask, null);
+
+        const signal_fd = try std.posix.signalfd(-1, &mask, 0);
+        errdefer std.posix.close(signal_fd);
 
         const battery = try Battery.init();
         errdefer if (battery) |b| b.deinit();
