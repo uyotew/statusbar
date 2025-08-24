@@ -135,7 +135,7 @@ pub fn main() !void {
     }
 }
 
-fn writeTime(writer: *std.Io.Writer, seconds: i64, timezone: Tz) !void {
+fn writeTime(writer: *std.Io.Writer, comptime fmt: []const u8, seconds: i64, timezone: Tz) !void {
     var i: usize = timezone.transitions.len - 1;
     const tz_seconds = while (i > 0) : (i -= 1) {
         const t = timezone.transitions[i];
@@ -147,19 +147,20 @@ fn writeTime(writer: *std.Io.Writer, seconds: i64, timezone: Tz) !void {
     const year_day = ep_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
     const day_secs = ep_secs.getDaySeconds();
-
-    const year = year_day.year;
-    const month = month_day.month.numeric();
-    const day = month_day.day_index + 1;
     // 1970-1-1 was a thursday
     const day_name_idx = (ep_day.day + 3) % 7;
     const day_name = ([_][]const u8{ "Mon", "Tue", "Wen", "Thu", "Fri", "Sat", "Sun" })[day_name_idx];
-    const hour = day_secs.getHoursIntoDay();
-    const minute = day_secs.getMinutesIntoHour();
 
-    const fmt = "{:0>4}-{:0>2}-{:0>2} {s} {:0>2}:{:0>2}";
-    const arg = .{ year, month, day, day_name, hour, minute };
-    return writer.print(fmt, arg);
+    inline for (fmt) |b| switch (b) {
+        'y' => try writer.print("{:0>4}", .{year_day.year}),
+        'M' => try writer.print("{:0>2}", .{month_day.month.numeric()}),
+        'd' => try writer.print("{:0>2}", .{month_day.day_index + 1}),
+        'D' => try writer.writeAll(day_name),
+        'h' => try writer.print("{:0>2}", .{day_secs.getHoursIntoDay()}),
+        'm' => try writer.print("{:0>2}", .{day_secs.getMinutesIntoHour()}),
+        's' => try writer.print("{:0>2}", .{day_secs.getSecondsIntoMinute()}),
+        else => try writer.writeByte(b),
+    };
 }
 
 fn printLog(log_path: []const u8, timezone: Tz) !void {
@@ -178,11 +179,8 @@ fn printLog(log_path: []const u8, timezone: Tz) !void {
     const stdout = &stdout_writer.interface;
 
     while (log.takeInt(i64, .little)) |line_timestamp| {
-        try stdout.writeAll("[");
-        try writeTime(stdout, line_timestamp, timezone);
-        try stdout.writeAll("] ");
-        _ = try log.streamDelimiter(stdout, '\n');
-        try stdout.writeAll("\n");
+        try writeTime(stdout, "[y-M-d h:m:s] ", line_timestamp, timezone);
+        try stdout.writeAll(try log.takeDelimiterInclusive('\n'));
     } else |err| switch (err) {
         error.EndOfStream => try stdout.flush(),
         else => return err,
@@ -338,7 +336,7 @@ const Daemon = struct {
                 });
             }
             const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-            try writeTime(stdout, ts.sec, timezone);
+            try writeTime(stdout, "y-M-d D h:m", ts.sec, timezone);
             try stdout.writeAll("\"}}],");
             try stdout.flush();
 
