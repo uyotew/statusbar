@@ -5,6 +5,8 @@ const Tz = @import("tz.zig").Tz;
 const fatal = std.process.fatal;
 const native_endian = builtin.cpu.arch.endian();
 
+const msg_buf_size = 516;
+
 var write_buffer: [4096]u8 = undefined;
 var read_buffer: [4096]u8 = undefined;
 
@@ -14,10 +16,9 @@ fn usage(progname: []const u8) noreturn {
         \\  {0s} --start
         \\  {0s} --log
         \\  {0s} [--log] [--name name | --no-name] [--retain s] cmd [args..]
-        \\     everything after options (cmd [args..]) will be given as an argument to sh -c
+        \\     everything after options (cmd [args..]) will be given as a string to sh -c
         \\     and its output will be redirected to the statusbar daemon
-        \\     if a line of output is too long, it will be divided into pieces
-        \\     max line length might be an option later
+        \\     if a line of output is too long, ({1} bytes) it will be folded
         \\ 
         \\    --help -h   this
         \\
@@ -39,7 +40,7 @@ fn usage(progname: []const u8) noreturn {
         \\                 as long as the program is running and 
         \\                 the line isn't overwritten
         \\ 
-    , .{progname});
+    , .{ progname, msg_buf_size });
     std.process.exit(0);
 }
 
@@ -229,7 +230,8 @@ const Daemon = struct {
     server: std.net.Server,
     log_writer: std.fs.File.Writer,
     epoll_fd: i32,
-    message: std.ArrayList(u8) = .empty,
+    message_buf: [msg_buf_size]u8 = undefined,
+    message_len: usize = 0,
     datetime: DateTime,
     audio: Audio,
     battery: ?Battery,
@@ -297,7 +299,6 @@ const Daemon = struct {
         std.posix.close(d.signal_fd);
         std.posix.close(d.epoll_fd);
         d.log_writer.file.close();
-        d.message.deinit(d.alc);
         d.server.deinit();
         d.datetime.deinit();
         if (d.battery) |bat| bat.deinit();
@@ -317,7 +318,7 @@ const Daemon = struct {
         try stdout.writeAll("{\"version\":1}\n[");
 
         while (true) {
-            try stdout.print("[{{\"full_text\":\"{s} \"}},", .{d.message.items});
+            try stdout.print("[{{\"full_text\":\"{s} \"}},", .{d.message_buf[0..d.message_len]});
             // pango markup to have volume struck out when muted
             try stdout.writeAll("{{\"markup\":\"pango\",\"full_text\": \" ");
             try stdout.print("({s}{s}{d:.2}{s}) ", .{
@@ -349,6 +350,9 @@ const Daemon = struct {
                     return; // exit cleanly when recieving int or term signals
                 } else if (fd == d.server.stream.handle) {
                     const conn = try d.server.accept();
+                    var flags = try std.posix.fcntl(conn.stream.handle, std.os.linux.F.GETFL, 0);
+                    flags |= 1 << @bitOffsetOf(std.os.linux.O, "NONBLOCK");
+                    _ = try std.posix.fcntl(conn.stream.handle, std.os.linux.F.SETFL, flags);
                     try addToEpoll(d.epoll_fd, conn.stream.handle);
                 } else if (fd == d.audio.cmd.stdout.?.handle) {
                     try d.audio.updateOnce();
@@ -360,29 +364,31 @@ const Daemon = struct {
                     _ = try std.posix.read(d.battery.?.timer_fd, &trash_buf); //reset timer
                     d.battery.?.capacity = try Battery.getNewCapacity(d.battery.?.cap_files);
                 } else {
-                    if (d.message.capacity > 1024) try d.message.resize(d.alc, 1024);
-                    var msg_writer: std.Io.Writer.Allocating = .fromArrayList(d.alc, &d.message);
-                    const msg = &msg_writer.writer;
-                    // handle messages from connections accepted earlier (from fd)
-                    // reuse write_buf
-                    var conn_reader = (std.net.Stream{ .handle = fd }).reader(&write_buf);
+                    var conn_reader = (std.net.Stream{ .handle = fd }).reader(&read_buffer);
                     const conn = conn_reader.interface();
-                    // this will not block long, since every message sent by the sender
-                    // has to end in a newline, and is sent in full
-                    _ = conn.streamDelimiter(msg, '\n') catch |err| switch (err) {
-                        error.EndOfStream => {
-                            const EPOLL = std.os.linux.EPOLL;
-                            try std.posix.epoll_ctl(d.epoll_fd, EPOLL.CTL_DEL, fd, null);
-                            std.posix.close(fd);
-                        },
-                        else => return err,
-                    };
-                    d.message = msg_writer.toArrayList();
+                    while (true) {
+                        const msg = conn.takeDelimiterExclusive('\n') catch |err| switch (err) {
+                            //every msg sendt should be <= to msg_buf_size
+                            error.StreamTooLong => unreachable,
+                            error.EndOfStream => {
+                                const EPOLL = std.os.linux.EPOLL;
+                                try std.posix.epoll_ctl(d.epoll_fd, EPOLL.CTL_DEL, fd, null);
+                                std.posix.close(fd);
+                                break;
+                            },
+                            error.ReadFailed => switch (conn_reader.getError().?) {
+                                error.WouldBlock => break,
+                                else => |e| return e,
+                            },
+                        };
+                        d.message_len = msg.len;
+                        @memcpy(d.message_buf[0..d.message_len], msg);
 
-                    const log = &d.log_writer.interface;
-                    try log.writeInt(i64, std.time.timestamp(), .little);
-                    try log.print("{s}\n", .{d.message.items});
-                    try log.flush();
+                        const log = &d.log_writer.interface;
+                        try log.writeInt(i64, std.time.timestamp(), .little);
+                        try log.print("{s}\n", .{d.message_buf[0..d.message_len]});
+                        try log.flush();
+                    }
                 }
             }
         }
