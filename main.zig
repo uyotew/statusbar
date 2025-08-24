@@ -208,16 +208,24 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
     var cmd_out_reader = cmd.stdout.?.reader(&read_buf);
     const cmd_out = &cmd_out_reader.interface;
 
-    if (args.name) |cmd_name| try daemon.print("{s}: ", .{cmd_name});
-    while (cmd_out.streamDelimiter(daemon, '\n')) |_| {
-        try daemon.writeAll("\n");
+    const heading_len = if (args.name) |n| n.len + 2 else 0;
+    if (heading_len >= msg_buf_size) fatal("cmd name too long ", .{});
+
+    while (true) {
+        if (args.name) |n| try daemon.print("{s}: ", .{n});
+        var line = cmd_out.peekDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => if (cmd_out.bufferedLen() > 0) cmd_out.buffered() else break,
+            error.StreamTooLong => cmd_out.buffered(),
+            else => return err,
+        };
+        // fold lines that are too long
+        if (heading_len + line.len + 1 > msg_buf_size) {
+            line = line[0 .. msg_buf_size - (heading_len + 1)];
+        }
+        try daemon.print("{s}\n", .{line});
+        cmd_out.toss(line.len);
+        if (cmd_out.bufferedLen() > 0 and cmd_out.buffered()[0] == '\n') cmd_out.toss(1);
         try daemon.flush();
-    } else |err| switch (err) {
-        error.EndOfStream => {
-            try daemon.writeAll("\n");
-            try daemon.flush();
-        },
-        else => return err,
     }
     _ = try cmd.wait();
 }
