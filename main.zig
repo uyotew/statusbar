@@ -118,17 +118,15 @@ pub fn main() !void {
     const tzfile = try std.fs.openFileAbsolute("/etc/localtime", .{});
     defer tzfile.close();
 
-    var read_buf: [4096]u8 = undefined;
-    var tz_reader = tzfile.reader(&read_buf);
-    var timezone = try Tz.parse(alc, &tz_reader.interface);
+    var tzfile_reader = tzfile.reader(&read_buffer);
+    var timezone = try Tz.parse(alc, &tzfile_reader.interface);
     defer timezone.deinit();
 
     switch (try Args.parse(args_input)) {
         .log => try printLog(log_path, timezone),
         .send => |args| try sendOutputToDaemon(alc, args, socket_path),
         .start => {
-            var log_buf: [1024]u8 = undefined;
-            var daemon: Daemon = try .init(alc, socket_path, log_path, &log_buf);
+            var daemon: Daemon = try .init(alc, socket_path, log_path);
             defer daemon.deinit(socket_path, log_path);
             try daemon.run(timezone);
         },
@@ -170,12 +168,10 @@ fn printLog(log_path: []const u8, timezone: Tz) !void {
     };
     defer log_file.close();
 
-    var reader_buf: [4096]u8 = undefined;
-    var log_reader = log_file.reader(&reader_buf);
+    var log_reader = log_file.reader(&read_buffer);
     const log = &log_reader.interface;
 
-    var writer_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&writer_buf);
+    var stdout_writer = std.fs.File.stdout().writer(&write_buffer);
     const stdout = &stdout_writer.interface;
 
     while (log.takeInt(i64, .little)) |line_timestamp| {
@@ -197,15 +193,14 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
     };
     defer unix_sock.close();
 
-    var write_buf: [256]u8 = undefined;
-    var unix_sock_writer = unix_sock.writer(&write_buf);
+    var unix_sock_writer = unix_sock.writer(&write_buffer);
     const daemon = &unix_sock_writer.interface;
 
     var cmd = std.process.Child.init(&.{ "sh", "-c", cmd_line }, alc);
     cmd.stdout_behavior = .Pipe;
     try cmd.spawn();
-    var read_buf: [256]u8 = undefined;
-    var cmd_out_reader = cmd.stdout.?.reader(&read_buf);
+
+    var cmd_out_reader = cmd.stdout.?.reader(&read_buffer);
     const cmd_out = &cmd_out_reader.interface;
 
     const heading_len = if (args.name) |n| n.len + 2 else 0;
@@ -242,7 +237,7 @@ const Daemon = struct {
     audio: Audio,
     battery: ?Battery,
 
-    fn init(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8, log_buf: []u8) !Daemon {
+    fn init(alc: std.mem.Allocator, socket_path: []const u8, log_path: []const u8) !Daemon {
         const addr = try std.net.Address.initUnix(socket_path);
         var server = addr.listen(.{}) catch |err| switch (err) {
             error.AddressInUse => fatal("daemon already running, or previous socket ({s}) was not removed", .{socket_path}),
@@ -290,7 +285,7 @@ const Daemon = struct {
             .alc = alc,
             .signal_fd = signal_fd,
             .server = server,
-            .log_writer = log_file.writer(log_buf),
+            .log_writer = log_file.writer(&write_buffer),
             .epoll_fd = epoll_fd,
             .audio = audio,
             .datetime = datetime,
@@ -319,8 +314,7 @@ const Daemon = struct {
         const wait_max_events = 16;
         var events: [wait_max_events]std.os.linux.epoll_event = undefined;
 
-        var write_buf: [516]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&write_buf);
+        var stdout_writer = std.fs.File.stdout().writer(&write_buffer);
         const stdout = &stdout_writer.interface;
         // header for swaybar-protocol
         try stdout.writeAll("{\"version\":1}\n[");
@@ -351,11 +345,10 @@ const Daemon = struct {
             try stdout.flush();
 
             const n_fds = std.posix.epoll_wait(d.epoll_fd, &events, -1);
-            var trash_buf: [8]u8 = undefined;
             for (events[0..n_fds]) |ev| {
                 const fd = ev.data.fd;
                 if (fd == d.signal_fd) {
-                    return; // exit cleanly when recieving int or term signals
+                    return; // exit when receiving int or term signals
                 } else if (fd == d.server.stream.handle) {
                     const conn = try d.server.accept();
                     var flags = try std.posix.fcntl(conn.stream.handle, std.os.linux.F.GETFL, 0);
@@ -365,11 +358,11 @@ const Daemon = struct {
                 } else if (fd == d.audio.cmd.stdout.?.handle) {
                     try d.audio.updateOnce();
                 } else if (fd == d.datetime.timer_fd) {
-                    _ = try std.posix.read(d.datetime.timer_fd, &trash_buf); //reset timer
+                    _ = try std.posix.read(d.datetime.timer_fd, &read_buffer); //reset timer
                 } else if (d.battery != null and fd == d.battery.?.ac_netlink.sock.handle) {
                     d.battery.?.ac_status = try d.battery.?.ac_netlink.getAcStatus() orelse continue;
                 } else if (d.battery != null and fd == d.battery.?.timer_fd) {
-                    _ = try std.posix.read(d.battery.?.timer_fd, &trash_buf); //reset timer
+                    _ = try std.posix.read(d.battery.?.timer_fd, &read_buffer); //reset timer
                     d.battery.?.capacity = try Battery.getNewCapacity(d.battery.?.cap_files);
                 } else {
                     var conn_reader = (std.net.Stream{ .handle = fd }).reader(&read_buffer);
@@ -441,7 +434,7 @@ const Audio = struct {
     }
 
     fn updateOnce(a: *Audio) !void {
-        var read_buf: [8]u8 = undefined;
+        var read_buf: [7]u8 = undefined;
         var cmd_reader = a.cmd.stdout.?.reader(&read_buf);
         const cmd = &cmd_reader.interface;
         a.volume = try std.fmt.parseFloat(f16, try cmd.take(4));
