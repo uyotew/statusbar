@@ -3,6 +3,10 @@ const builtin = @import("builtin");
 const Tz = @import("tz.zig").Tz;
 
 const fatal = std.process.fatal;
+const native_endian = builtin.cpu.arch.endian();
+
+var write_buffer: [4096]u8 = undefined;
+var read_buffer: [4096]u8 = undefined;
 
 fn usage(progname: []const u8) noreturn {
     std.log.info(
@@ -323,7 +327,7 @@ const Daemon = struct {
                 if (d.audio.muted) "</s>" else "",
             });
             if (d.battery) |bat| {
-                try stdout.print("{s}[{}%]", .{
+                try stdout.print("{s}[{}%] ", .{
                     switch (bat.ac_status) {
                         .online => "^",
                         .offline => "",
@@ -484,7 +488,8 @@ const Battery = struct {
         };
         defer ac.close();
 
-        const ac_status: Netlink.AcStatus = switch (try ac.reader().readByte()) {
+        var ac_reader = ac.reader(&read_buffer);
+        const ac_status: Netlink.AcStatus = switch (try ac_reader.interface.takeByte()) {
             '0' => .offline,
             '1' => .online,
             else => .unknown,
@@ -500,6 +505,7 @@ const Battery = struct {
             else => return err,
         };
         errdefer if (b0) |f| f.close();
+
         const b1 = std.fs.openFileAbsolute("/sys/class/power_supply/BAT1/capacity", .{}) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
@@ -535,16 +541,17 @@ const Battery = struct {
     }
 
     fn getNewCapacity(files: [2]?std.fs.File) !u8 {
-        var buf: [4]u8 = undefined;
         var cap: u8 = 0;
         var count: u8 = 0;
-        for (files) |bat| {
-            if (bat) |b| {
+        for (files) |file| {
+            if (file) |f| {
                 count += 1;
-                // need to read from beginning of file each time
-                const n = try b.preadAll(&buf, 0);
-                // n-1 to remove the newline
-                cap += try std.fmt.parseInt(u8, buf[0 .. n - 1], 10);
+                var battery_file_reader = f.reader(&read_buffer);
+                try battery_file_reader.seekTo(0); // need to read from beginning of file each time
+                const battery = &battery_file_reader.interface;
+
+                const int_str = try battery.takeDelimiterExclusive('\n');
+                cap += try std.fmt.parseInt(u8, int_str, 10);
             }
         }
         std.debug.assert(count > 0);
@@ -580,24 +587,35 @@ const Battery = struct {
             version: u8 = 1,
             reserved: u16 = 0,
         };
-        const Attr = extern struct {
+        const CtrlAttr = extern struct {
             len: u16, //not including padding
-            type: u16,
+            type: CTRL_ATTR,
             // payload
             // and padding to reach a multiple of 4 bytes
+            const CTRL_ATTR = enum(u16) {
+                UNSPEC,
+                FAMILY_ID,
+                FAMILY_NAME,
+                VERSION,
+                HDRSIZE,
+                MAXATTR,
+                OPS,
+                MCAST_GROUPS,
+                POLICY,
+                OP_POLICY,
+                OP,
+            };
         };
-        const CTRL_ATTR = enum {
-            UNSPEC,
-            FAMILY_ID,
-            FAMILY_NAME,
-            VERSION,
-            HDRSIZE,
-            MAXATTR,
-            OPS,
-            MCAST_GROUPS,
-            POLICY,
-            OP_POLICY,
-            OP,
+        const MCastAttr = extern struct {
+            len: u16, //not including padding
+            type: MCAST_GRP,
+            // payload
+            // and padding to reach a multiple of 4 bytes
+            const MCAST_GRP = enum(u16) {
+                UNSPEC,
+                NAME,
+                ID,
+            };
         };
 
         fn init() !Netlink {
@@ -614,139 +632,118 @@ const Battery = struct {
             try std.posix.setsockopt(nl_sock, linux.SOL.NETLINK, NETLINK_CAP_ACK, &.{ 1, 0, 0, 0 });
             return .{ .sock = .{ .handle = nl_sock } };
         }
-        fn deinit(self: Netlink) void {
-            self.sock.close();
+        fn deinit(nl: Netlink) void {
+            nl.sock.close();
         }
 
         const msg_size = @max(std.heap.pageSize(), 8192);
 
         /// blocking.. after this the socket can be polled for acpi events
         /// and the socket will be non-blocking
-        fn subscribeToAcpiEvents(self: *Netlink) !void {
-            var buf: [msg_size]u8 = undefined;
-            var msg = std.io.fixedBufferStream(&buf);
-            // skip header, will be set last to get correct length
-            try msg.seekBy(@sizeOf(Header));
+        fn subscribeToAcpiEvents(nl: *Netlink) !void {
+            var read_buf: [msg_size]u8 = undefined;
+            var sock_reader = nl.sock.reader(&read_buf);
+            const r = &sock_reader.interface;
 
-            const CTRL_CMD_GETFAMILY = 3;
-            try msg.writer().writeStruct(Generic{ .cmd = CTRL_CMD_GETFAMILY });
+            var write_buf: [msg_size]u8 = undefined;
+            var sock_writer = nl.sock.writer(&write_buf);
+            const w = &sock_writer.interface;
 
             const name = "acpi_event";
-            try msg.writer().writeStruct(Attr{
-                .len = @sizeOf(Attr) + name.len + 1,
-                .type = @intFromEnum(CTRL_ATTR.FAMILY_NAME),
-            });
-            try msg.writer().writeAll(name);
-            // should be null terminated
-            try msg.writer().writeByte(0);
-            // pad to alignment of 4
-            try msg.writer().writeByte(0);
 
             const GENL_ID_CTRL = 0x10;
-            buf[0..@sizeOf(Header)].* = @bitCast(Header{
-                .len = @intCast(msg.pos),
+            try w.writeStruct(Header{
+                .len = @sizeOf(Header) + @sizeOf(Generic) + @sizeOf(CtrlAttr) + name.len + 1 + 1,
                 .type = GENL_ID_CTRL,
                 .flags = linux.NLM_F_REQUEST | linux.NLM_F_ACK,
-                .seq = self.seq,
+                .seq = nl.seq,
                 .pid = 0,
-            });
-            self.seq += 1;
+            }, native_endian);
+            nl.seq += 1;
 
-            try self.sock.writeAll(msg.getWritten());
+            const CTRL_CMD_GETFAMILY = 3;
+            try w.writeStruct(Generic{ .cmd = CTRL_CMD_GETFAMILY }, native_endian);
 
-            var group_id: ?u32 = null;
-            outer: while (true) {
-                const n = try self.sock.read(&buf);
-                // now msg contains the last recieved message
-                msg.reset();
-                while (msg.pos < n) {
-                    const msg_start = msg.pos;
-                    const header = try msg.reader().readStruct(Header);
-                    const NLM_F_ACK_TLVS = 0x200;
-                    switch (header.type) {
-                        // NOOP, and OVERRUN (not used)
-                        1, 4 => unreachable,
-                        // ERROR/ACK
-                        2 => {
-                            const err = try msg.reader().readStruct(Error);
-                            if (err.err == 0) break :outer;
-                            if (header.flags & NLM_F_ACK_TLVS > 0) {
-                                std.debug.print("extra info exists\n", .{});
-                            }
-                            fatal("netlink error: {any}\n{any}", .{ header, err });
-                        },
-                        // DONE
-                        3 => unreachable, // since dump isnt used?
-                        // not a control message
-                        else => {},
-                    }
-                    _ = try msg.reader().readStruct(Generic);
-                    while (msg.pos < msg_start + header.len) {
-                        const attr = try msg.reader().readStruct(Attr);
-                        const attr_type: CTRL_ATTR = @enumFromInt(attr.type);
-                        const len = attr.len - @sizeOf(Attr);
-                        const val = buf[msg.pos..][0..len];
-                        if (attr_type == .MCAST_GROUPS) {
-                            const MCAST_GRP = enum {
-                                UNSPEC,
-                                NAME,
-                                ID,
-                            };
-                            // first attr is useless? so skip it
-                            var i: usize = @sizeOf(Attr);
-                            while (i < len) {
-                                const grp_attr: *Attr = @alignCast(@ptrCast(val[i..][0..@sizeOf(Attr)]));
-                                i += @sizeOf(Attr);
-                                const grp_val = val[i..][0 .. grp_attr.len - @sizeOf(Attr)];
-                                const grp_attr_type: MCAST_GRP = @enumFromInt(grp_attr.type);
-                                if (grp_attr_type == .ID) group_id = @bitCast(grp_val[0..4].*);
-                                i += std.mem.alignForward(usize, grp_val.len, 4);
-                            }
+            try w.writeStruct(CtrlAttr{
+                .len = @sizeOf(CtrlAttr) + name.len + 1,
+                .type = .FAMILY_NAME,
+            }, native_endian);
+            // name should be null terminated and the message should have an alignment of 4
+            try w.print("{s}\x00\x00", .{name});
+            try w.flush();
+
+            var group_id: ?[4]u8 = null;
+
+            while (true) {
+                const header = try r.takeStruct(Header, native_endian);
+                const msg_len = std.mem.alignForward(usize, header.len - @sizeOf(Header), 4);
+                var msg_r: std.Io.Reader = .fixed(try r.take(msg_len));
+
+                switch (header.type) {
+                    1, 4 => unreachable, // NOOP, and OVERRUN (not used)
+                    2 => { // ERROR/ACK
+                        const err = try msg_r.takeStruct(Error, native_endian);
+                        if (err.err == 0) break; //success ACK
+                        const NLM_F_ACK_TLVS = 0x200;
+                        if (header.flags & NLM_F_ACK_TLVS > 0) {
+                            std.debug.print("extra info exists\n", .{});
                         }
-                        const off = std.mem.alignForward(i64, len, 4);
-                        try msg.seekBy(off);
-                    }
+                        fatal("netlink error: {any}\n{any}", .{ header, err });
+                    },
+                    3 => unreachable, // DONE, unreachable since dump isnt used?
+                    else => {}, // not a control message
                 }
+
+                msg_r.toss(@sizeOf(Generic));
+
+                while (msg_r.takeStruct(CtrlAttr, native_endian)) |attr| {
+                    const attr_len = std.mem.alignForward(usize, attr.len - @sizeOf(CtrlAttr), 4);
+                    var attr_r: std.Io.Reader = .fixed(try msg_r.take(attr_len));
+                    if (attr.type == .MCAST_GROUPS) {
+                        attr_r.toss(@sizeOf(MCastAttr)); // skip first attr
+                        while (attr_r.takeStruct(MCastAttr, native_endian)) |grp_attr| {
+                            const len_with_padding = std.mem.alignForward(usize, grp_attr.len - @sizeOf(MCastAttr), 4);
+                            const grp_val = try attr_r.take(len_with_padding);
+                            if (grp_attr.type == .ID) group_id = grp_val[0..4].*;
+                        } else |err| if (err != error.EndOfStream) return err;
+                    }
+                } else |err| if (err != error.EndOfStream) return err;
             }
+
             const NETLINK_ADD_MEMBERSHIP = 1;
             try std.posix.setsockopt(
-                self.sock.handle,
+                nl.sock.handle,
                 linux.SOL.NETLINK,
                 NETLINK_ADD_MEMBERSHIP,
-                std.mem.asBytes(&(group_id orelse return error.NoGroupIdFound)),
+                if (group_id) |gi| &gi else return error.NoGroupIdFound,
             );
 
-            var flags = try std.posix.fcntl(self.sock.handle, linux.F.GETFL, 0);
+            var flags = try std.posix.fcntl(nl.sock.handle, linux.F.GETFL, 0);
             flags |= 1 << @bitOffsetOf(linux.O, "NONBLOCK");
-            _ = try std.posix.fcntl(self.sock.handle, linux.F.SETFL, flags);
+            _ = try std.posix.fcntl(nl.sock.handle, linux.F.SETFL, flags);
         }
 
         const AcStatus = enum { offline, online, unknown };
 
         /// call when events are ready to be read
         /// after subscribing
-        fn getAcStatus(self: Netlink) !?AcStatus {
-            var buf: [msg_size]u8 = undefined;
+        fn getAcStatus(nl: *Netlink) !?AcStatus {
+            var read_buf: [msg_size]u8 = undefined;
+            var sock_reader = nl.sock.reader(&read_buf);
+            const r = &sock_reader.interface;
+
             var status: ?AcStatus = null;
 
             while (true) {
-                const n = self.sock.read(&buf) catch |err| switch (err) {
-                    error.WouldBlock => return status,
-                    else => return err,
-                };
-                var i: usize = 0;
-                while (i < n) {
-                    // skip all of these
-                    // should maybe check header for errors?
-                    i += @sizeOf(Header) + @sizeOf(Generic) + @sizeOf(Attr);
-
-                    const event: *AcpiGenlEvent = @alignCast(@ptrCast(buf[i..][0..@sizeOf(AcpiGenlEvent)]));
-                    i += @sizeOf(AcpiGenlEvent);
-                    if (event.acStatus()) |new_status| {
-                        status = new_status;
-                    }
+                const to_skip = @sizeOf(Header) + @sizeOf(Generic) + @sizeOf(CtrlAttr);
+                r.fill(to_skip + @sizeOf(AcpiGenlEvent)) catch break;
+                r.discardAll(to_skip) catch unreachable;
+                const event: *AcpiGenlEvent = @alignCast(r.takeStructPointer(AcpiGenlEvent) catch unreachable);
+                if (event.acStatus()) |new_status| {
+                    status = new_status;
                 }
             }
+            return if (sock_reader.err.? == error.WouldBlock) status else sock_reader.err.?;
         }
 
         // defined in linux kernel src
@@ -761,11 +758,11 @@ const Battery = struct {
                 std.debug.assert(@alignOf(@This()) == 4);
             }
 
-            fn acStatus(self: AcpiGenlEvent) ?AcStatus {
+            fn acStatus(ae: *const AcpiGenlEvent) ?AcStatus {
                 const class = "ac_adapter";
-                if (!std.mem.eql(u8, class, self.device_class[0..class.len])) return null;
+                if (!std.mem.eql(u8, class, ae.device_class[0..class.len])) return null;
                 // linux-src/drivers/acpi/ac.c
-                return switch (self.data) {
+                return switch (ae.data) {
                     0x00 => .offline,
                     0x01 => .online,
                     0xff => .unknown,
