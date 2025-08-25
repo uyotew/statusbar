@@ -5,8 +5,6 @@ const Tz = @import("tz.zig").Tz;
 const fatal = std.process.fatal;
 const native_endian = builtin.cpu.arch.endian();
 
-const msg_buf_size = 516;
-
 var write_buffer: [4096]u8 = undefined;
 var read_buffer: [4096]u8 = undefined;
 
@@ -28,9 +26,7 @@ fn usage(progname: []const u8) noreturn {
         \\  
         \\  args valid when running a child command: (all optional)
         \\    --log        log every line of the redirected program 
-        \\                 with timestamps to a temporary file 
-        \\                 that is removed when the main daemon exits
-        \\                   currently does nothing, everything is logged
+        \\                 to the temporary log
         \\    --name name  every line output is prefixed with this name.
         \\                 uses cmd by default
         \\    --no-name    do not prefix output with anything
@@ -40,7 +36,7 @@ fn usage(progname: []const u8) noreturn {
         \\                 as long as the program is running and 
         \\                 the line isn't overwritten
         \\ 
-    , .{ progname, msg_buf_size });
+    , .{ progname, MessageCon.message_max_len });
     std.process.exit(0);
 }
 
@@ -50,10 +46,10 @@ const Args = union(enum) {
     start,
 
     const Send = struct {
-        log: bool = false,
         name: ?[]const u8 = null,
-        retain: u16 = 0,
         cmd: []const []const u8,
+        log: bool = false,
+        retain: u16 = 0,
     };
 
     fn parse(raw_args: []const []const u8) !Args {
@@ -91,7 +87,10 @@ const Args = union(enum) {
         }
         if (args_idx == args.len) fatal("expected cmd after options", .{});
         send.cmd = args[args_idx..];
-        if (!no_name and send.name == null) send.name = args[args_idx];
+        if (!no_name) {
+            if (send.name == null) send.name = args[args_idx];
+            if (send.name.?.len > MessageCon.name_max_len) fatal("cmd name too long", .{});
+        }
         return Args{ .send = send };
     }
 };
@@ -183,6 +182,28 @@ fn printLog(log_path: []const u8, timezone: Tz) !void {
     }
 }
 
+const MessageCon = struct {
+    const message_max_len = 256;
+    const name_max_len = 128;
+
+    message_buf: [message_max_len]u8 = undefined,
+    message_len: usize = 0,
+    name_buf: [name_max_len]u8 = undefined,
+    name_len: usize = 0,
+    retain: u16 = 0,
+    retain_timer_fd: ?std.posix.fd_t = null,
+    log: bool,
+    con_fd: ?std.posix.fd_t = null, // null if message is retained after the connection is closed
+};
+
+const MessageHeader = packed struct {
+    retain: u16,
+    log: bool,
+    padding: u7 = 0,
+    name_len: usize = 0,
+    // name_len bytes
+};
+
 fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []const u8) !void {
     const cmd_line = try std.mem.join(alc, " ", args.cmd);
     defer alc.free(cmd_line);
@@ -203,19 +224,22 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
     var cmd_out_reader = cmd.stdout.?.reader(&read_buffer);
     const cmd_out = &cmd_out_reader.interface;
 
-    const heading_len = if (args.name) |n| n.len + 2 else 0;
-    if (heading_len >= msg_buf_size) fatal("cmd name too long ", .{});
+    try daemon.writeStruct(MessageHeader{
+        .retain = args.retain,
+        .log = args.log,
+        .name_len = if (args.name) |n| n.len else 0,
+    }, .little);
+    if (args.name) |n| try daemon.writeAll(n);
 
     while (true) {
-        if (args.name) |n| try daemon.print("{s}: ", .{n});
         var line = cmd_out.peekDelimiterExclusive('\n') catch |err| switch (err) {
             error.EndOfStream => if (cmd_out.bufferedLen() > 0) cmd_out.buffered() else break,
             error.StreamTooLong => cmd_out.buffered(),
             else => return err,
         };
         // fold lines that are too long
-        if (heading_len + line.len + 1 > msg_buf_size) {
-            line = line[0 .. msg_buf_size - (heading_len + 1)];
+        if (line.len + 1 > MessageCon.message_max_len) {
+            line = line[0 .. MessageCon.message_max_len - 1];
         }
         try daemon.print("{s}\n", .{line});
         cmd_out.toss(line.len);
@@ -231,8 +255,7 @@ const Daemon = struct {
     server: std.net.Server,
     log_writer: std.fs.File.Writer,
     epoll_fd: i32,
-    message_buf: [msg_buf_size]u8 = undefined,
-    message_len: usize = 0,
+    message_cons: std.ArrayList(MessageCon) = .empty,
     datetime: DateTime,
     audio: Audio,
     battery: ?Battery,
@@ -301,6 +324,7 @@ const Daemon = struct {
     fn deinit(d: *Daemon, socket_path: []const u8, log_path: []const u8) void {
         std.posix.close(d.signal_fd);
         std.posix.close(d.epoll_fd);
+        d.message_cons.deinit(d.alc);
         d.log_writer.file.close();
         d.server.deinit();
         d.datetime.deinit();
@@ -320,7 +344,13 @@ const Daemon = struct {
         try stdout.writeAll("{\"version\":1}\n[");
 
         while (true) {
-            try stdout.print("[{{\"full_text\":\"{s} \"}},", .{d.message_buf[0..d.message_len]});
+            try stdout.writeByte('[');
+            for (d.message_cons.items) |mc| {
+                if (mc.message_len == 0) continue;
+                try stdout.writeAll("{{\"full_text\":\"");
+                if (mc.name_len > 0) try stdout.print("{s}: ", .{mc.name_buf[0..mc.name_len]});
+                try stdout.print("{s} \"}},", .{mc.message_buf[0..mc.message_len]});
+            }
             // pango markup to have volume struck out when muted
             try stdout.writeAll("{{\"markup\":\"pango\",\"full_text\": \" ");
             try stdout.print("({s}{s}{d:.2}{s}) ", .{
@@ -367,14 +397,59 @@ const Daemon = struct {
                 } else {
                     var conn_reader = (std.net.Stream{ .handle = fd }).reader(&read_buffer);
                     const conn = conn_reader.interface();
+                    //either a retain timer fd, old connection, or new connection
+                    const index = blk: for (d.message_cons.items, 0..) |mc, i| {
+                        if (mc.retain_timer_fd != null and mc.retain_timer_fd.? == fd) break :blk i;
+                        if (mc.con_fd != null and mc.con_fd.? == fd) break :blk i;
+                    } else {
+                        const mc = try d.message_cons.addOne(d.alc);
+                        const header = try conn.takeStruct(MessageHeader, .little);
+                        const name = try conn.take(header.name_len);
+                        mc.* = .{
+                            .con_fd = fd,
+                            .retain = header.retain,
+                            .log = header.log,
+                            .name_len = header.name_len,
+                        };
+                        @memcpy(mc.name_buf[0..mc.name_len], name);
+
+                        if (mc.retain != 0) {
+                            mc.retain_timer_fd = try std.posix.timerfd_create(std.os.linux.TIMERFD_CLOCK.REALTIME, .{});
+                            try addToEpoll(d.epoll_fd, mc.retain_timer_fd.?);
+                        }
+                        break :blk d.message_cons.items.len - 1;
+                    };
+
+                    const mc = &d.message_cons.items[index];
+
+                    if (mc.retain_timer_fd) |tfd| {
+                        if (tfd == fd) {
+                            mc.message_len = 0;
+                            _ = try std.posix.read(fd, &read_buffer); //reset timer MIGHT NOT BE NEEDED?
+                            if (mc.con_fd == null) {
+                                const EPOLL = std.os.linux.EPOLL;
+                                try std.posix.epoll_ctl(d.epoll_fd, EPOLL.CTL_DEL, fd, null);
+                                std.posix.close(fd);
+                                _ = d.message_cons.orderedRemove(index);
+                            }
+                            continue;
+                        } else {
+                            try std.posix.timerfd_settime(tfd, .{}, &.{
+                                .it_value = .{ .sec = mc.retain, .nsec = 0 },
+                                .it_interval = .{ .sec = 0, .nsec = 0 },
+                            }, null);
+                        }
+                    }
+                    std.debug.assert(fd == mc.con_fd.?);
                     while (true) {
                         const msg = conn.takeDelimiterExclusive('\n') catch |err| switch (err) {
-                            //every msg sendt should be <= to msg_buf_size
                             error.StreamTooLong => unreachable,
                             error.EndOfStream => {
                                 const EPOLL = std.os.linux.EPOLL;
                                 try std.posix.epoll_ctl(d.epoll_fd, EPOLL.CTL_DEL, fd, null);
                                 std.posix.close(fd);
+                                mc.con_fd = null;
+                                if (mc.retain == 0) _ = d.message_cons.orderedRemove(index);
                                 break;
                             },
                             error.ReadFailed => switch (conn_reader.getError().?) {
@@ -382,13 +457,15 @@ const Daemon = struct {
                                 else => |e| return e,
                             },
                         };
-                        d.message_len = msg.len;
-                        @memcpy(d.message_buf[0..d.message_len], msg);
-
-                        const log = &d.log_writer.interface;
-                        try log.writeInt(i64, std.time.timestamp(), .little);
-                        try log.print("{s}\n", .{d.message_buf[0..d.message_len]});
-                        try log.flush();
+                        mc.message_len = msg.len;
+                        @memcpy(mc.message_buf[0..mc.message_len], msg);
+                        if (mc.log) {
+                            const log = &d.log_writer.interface;
+                            try log.writeInt(i64, std.time.timestamp(), .little);
+                            if (mc.name_len > 0) try log.print("{s}: ", .{mc.name_buf[0..mc.name_len]});
+                            try log.print("{s}\n", .{mc.message_buf[0..mc.message_len]});
+                            try log.flush();
+                        }
                     }
                 }
             }
