@@ -350,7 +350,7 @@ const Daemon = struct {
             try stdout.writeByte('[');
             for (d.message_cons.items) |mc| {
                 if (mc.message_len == 0) continue;
-                try stdout.writeAll("{\"full_text\":\"");
+                try stdout.writeAll("{\"full_text\":\" ");
                 if (mc.name_len > 0) try stdout.print("{s}: ", .{mc.name_buf[0..mc.name_len]});
                 try stdout.print("{s} \"}},", .{mc.message_buf[0..mc.message_len]});
             }
