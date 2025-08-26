@@ -219,19 +219,20 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
     var unix_sock_writer = unix_sock.writer(&write_buffer);
     const daemon = &unix_sock_writer.interface;
 
-    var cmd = std.process.Child.init(&.{ "sh", "-c", cmd_line }, alc);
-    cmd.stdout_behavior = .Pipe;
-    try cmd.spawn();
-
-    var cmd_out_reader = cmd.stdout.?.reader(&read_buffer);
-    const cmd_out = &cmd_out_reader.interface;
-
     try daemon.writeStruct(MessageHeader{
         .retain = args.retain,
         .log = args.log,
         .name_len = if (args.name) |n| n.len else 0,
     }, .little);
     if (args.name) |n| try daemon.writeAll(n);
+    try daemon.flush();
+
+    var cmd = std.process.Child.init(&.{ "sh", "-c", cmd_line }, alc);
+    cmd.stdout_behavior = .Pipe;
+    try cmd.spawn();
+
+    var cmd_out_reader = cmd.stdout.?.reader(&read_buffer);
+    const cmd_out = &cmd_out_reader.interface;
 
     while (true) {
         var line = cmd_out.peekDelimiterExclusive('\n') catch |err| switch (err) {
