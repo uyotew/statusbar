@@ -349,12 +349,12 @@ const Daemon = struct {
             try stdout.writeByte('[');
             for (d.message_cons.items) |mc| {
                 if (mc.message_len == 0) continue;
-                try stdout.writeAll("{{\"full_text\":\"");
+                try stdout.writeAll("{\"full_text\":\"");
                 if (mc.name_len > 0) try stdout.print("{s}: ", .{mc.name_buf[0..mc.name_len]});
                 try stdout.print("{s} \"}},", .{mc.message_buf[0..mc.message_len]});
             }
             // pango markup to have volume struck out when muted
-            try stdout.writeAll("{{\"markup\":\"pango\",\"full_text\": \" ");
+            try stdout.writeAll("{\"markup\":\"pango\",\"full_text\": \" ");
             try stdout.print("({s}{s}{d:.2}{s}) ", .{
                 if (d.audio.bluetooth) "bt: " else "",
                 if (d.audio.muted) "<s>" else "",
@@ -373,7 +373,7 @@ const Daemon = struct {
             }
             const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
             try writeTime(stdout, "y-M-d D h:m", ts.sec, timezone);
-            try stdout.writeAll("\"}}],");
+            try stdout.writeAll("\"}],");
             try stdout.flush();
 
             const n_fds = std.posix.epoll_wait(d.epoll_fd, &events, -1);
