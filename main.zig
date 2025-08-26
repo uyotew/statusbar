@@ -4,6 +4,7 @@ const Tz = @import("tz.zig").Tz;
 
 const fatal = std.process.fatal;
 const native_endian = builtin.cpu.arch.endian();
+const version = "1.0";
 
 var write_buffer: [4096]u8 = undefined;
 var read_buffer: [4096]u8 = undefined;
@@ -17,8 +18,6 @@ fn usage(progname: []const u8) noreturn {
         \\     everything after options (cmd [args..]) will be given as a string to sh -c
         \\     and its output will be redirected to the statusbar daemon
         \\     if a line of output is too long, ({1} bytes) it will be folded
-        \\ 
-        \\    --help -h   this
         \\
         \\    --start     starts the daemon (must be the only arg)
         \\    --log       prints the full log to stdout (must be the only arg)
@@ -64,6 +63,9 @@ const Args = union(enum) {
             const arg = args[args_idx];
             if (std.mem.eql(u8, "--help", arg) or std.mem.eql(u8, "-h", arg)) {
                 usage(progname);
+            } else if (std.mem.eql(u8, "--version", arg) or std.mem.eql(u8, "-v", arg)) {
+                std.log.info("version: {s}", .{version});
+                std.process.exit(0);
             } else if (std.mem.eql(u8, "--log", arg)) {
                 if (args.len == 1) return Args.log;
                 send.log = true;
