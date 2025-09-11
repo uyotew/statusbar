@@ -11,10 +11,14 @@ bt_om = ObjectManager {
 }
 
 Core.require_api("default-nodes","mixer", function(default_nodes,mixer)
+  mixer["scale"] = "cubic"
   function print_info()
     local id = default_nodes:call("get-default-node","Audio/Sink")
     local volume = mixer:call("get-volume",id)
-    local volume_str = string.sub(tostring(volume.volume),1,4)
+    -- avoid tostring returning a number using scientific notation
+    local volume_num = (volume.volume < 0.01) and 0.0 or volume.volume
+    -- add an extra 0, since it might not always be present
+    local volume_str = string.sub(tostring(volume_num) ..'0',1,4)
 
     local node = bt_om:lookup{Constraint {"object.id", "=", id}}
     -- if node is found, bluetooth is used
