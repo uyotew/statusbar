@@ -14,6 +14,10 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    b.installFile("bash-completion.sh", b.pathJoin(
+        &.{ "share/bash-completion/completions/", exe.name },
+    ));
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
