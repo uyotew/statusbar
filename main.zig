@@ -192,14 +192,11 @@ const MessageCon = struct {
     message_len: usize = 0,
     name_buf: [name_max_len]u8 = undefined,
     name_len: usize = 0,
-    retain: u16 = 0,
-    retain_timer_fd: ?std.posix.fd_t = null,
     log: bool,
-    con_fd: ?std.posix.fd_t = null, // null if message is retained after the connection is closed
+    con_fd: std.posix.fd_t,
 };
 
 const MessageHeader = packed struct {
-    retain: u16,
     log: bool,
     padding: u7 = 0,
     name_len: usize = 0,
@@ -210,17 +207,16 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
     const cmd_line = try std.mem.join(alc, " ", args.cmd);
     defer alc.free(cmd_line);
 
-    const unix_sock = std.net.connectUnixSocket(socket_path) catch |err| switch (err) {
+    const sock = std.net.connectUnixSocket(socket_path) catch |err| switch (err) {
         error.FileNotFound => fatal("cannot connect to daemon, make sure it is started with --start", .{}),
         else => return err,
     };
-    defer unix_sock.close();
+    defer sock.close();
 
-    var unix_sock_writer = unix_sock.writer(&write_buffer);
-    const daemon = &unix_sock_writer.interface;
+    var sock_writer = sock.writer(&write_buffer);
+    const daemon = &sock_writer.interface;
 
     try daemon.writeStruct(MessageHeader{
-        .retain = args.retain,
         .log = args.log,
         .name_len = if (args.name) |n| n.len else 0,
     }, .little);
@@ -234,20 +230,67 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
     var cmd_out_reader = cmd.stdout.?.reader(&read_buffer);
     const cmd_out = &cmd_out_reader.interface;
 
-    while (true) {
-        var line = cmd_out.peekDelimiterExclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => if (cmd_out.bufferedLen() > 0) cmd_out.buffered() else break,
-            error.StreamTooLong => cmd_out.buffered(),
-            else => return err,
-        };
-        // fold lines that are too long
-        if (line.len + 1 > MessageCon.message_max_len) {
-            line = line[0 .. MessageCon.message_max_len - 1];
+    const epoll_fd = try std.posix.epoll_create1(0);
+    defer std.posix.close(epoll_fd);
+
+    const EPOLL = std.os.linux.EPOLL;
+    {
+        var ev: std.os.linux.epoll_event = .{ .data = .{ .fd = cmd.stdout.?.handle }, .events = EPOLL.IN };
+        try std.posix.epoll_ctl(epoll_fd, EPOLL.CTL_ADD, cmd.stdout.?.handle, &ev);
+    }
+
+    var timer_fd: ?std.posix.fd_t = null;
+    if (args.retain != 0) {
+        timer_fd = try std.posix.timerfd_create(std.os.linux.TIMERFD_CLOCK.REALTIME, .{});
+        var ev: std.os.linux.epoll_event = .{ .data = .{ .fd = timer_fd.? }, .events = EPOLL.IN | EPOLL.ET };
+        try std.posix.epoll_ctl(epoll_fd, EPOLL.CTL_ADD, timer_fd.?, &ev);
+    }
+    var stream_ended = false;
+    const wait_max_events = 16;
+    var events: [wait_max_events]std.os.linux.epoll_event = undefined;
+    loop: while (true) {
+        const n_fds = std.posix.epoll_wait(epoll_fd, &events, -1);
+        for (events[0..n_fds]) |ev| {
+            const fd = ev.data.fd;
+            if (timer_fd != null and fd == timer_fd.?) {
+                if (stream_ended) break :loop;
+                _ = try std.posix.write(sock.handle, "\n");
+            } else if (fd == cmd.stdout.?.handle) {
+                // TODO::should be non-blocking?
+                var line = cmd_out.peekDelimiterExclusive('\n') catch |err| switch (err) {
+                    error.EndOfStream => blk: {
+                        stream_ended = true;
+                        try std.posix.epoll_ctl(epoll_fd, EPOLL.CTL_DEL, cmd.stdout.?.handle, null);
+                        break :blk cmd_out.buffered();
+                    },
+                    error.StreamTooLong => cmd_out.buffered(),
+                    else => return err,
+                };
+                if (timer_fd) |tfd| {
+                    try std.posix.timerfd_settime(tfd, .{}, &.{
+                        .it_value = .{ .sec = args.retain, .nsec = 0 },
+                        .it_interval = .{ .sec = 0, .nsec = 0 },
+                    }, null);
+                }
+                // do not send an empty message at EndOfStream
+                // since the last message should be retained (if retain is not 0)
+                if (!(stream_ended and line.len == 0)) {
+                    while (true) {
+                        // fold lines that are too long
+                        if (line.len + 1 > MessageCon.message_max_len) {
+                            line = line[0 .. MessageCon.message_max_len - 1];
+                        }
+                        try daemon.print("{s}\n", .{line});
+                        cmd_out.toss(line.len);
+                        if (cmd_out.bufferedLen() > 0 and cmd_out.buffered()[0] == '\n') cmd_out.toss(1);
+                        line = cmd_out.buffered();
+                        if (line.len == 0) break;
+                    }
+                    try daemon.flush();
+                }
+                if (timer_fd == null and stream_ended) break :loop;
+            }
         }
-        try daemon.print("{s}\n", .{line});
-        cmd_out.toss(line.len);
-        if (cmd_out.bufferedLen() > 0 and cmd_out.buffered()[0] == '\n') cmd_out.toss(1);
-        try daemon.flush();
     }
     _ = try cmd.wait();
 }
@@ -338,9 +381,6 @@ const Daemon = struct {
     }
 
     fn run(d: *Daemon, timezone: Tz) !void {
-        const wait_max_events = 16;
-        var events: [wait_max_events]std.os.linux.epoll_event = undefined;
-
         var stdout_writer = std.fs.File.stdout().writer(&write_buffer);
         const stdout = &stdout_writer.interface;
         // header for swaybar-protocol
@@ -377,6 +417,9 @@ const Daemon = struct {
             try stdout.writeAll("\"}],");
             try stdout.flush();
 
+            const wait_max_events = 16;
+            var events: [wait_max_events]std.os.linux.epoll_event = undefined;
+
             const n_fds = std.posix.epoll_wait(d.epoll_fd, &events, -1);
             for (events[0..n_fds]) |ev| {
                 const fd = ev.data.fd;
@@ -400,59 +443,30 @@ const Daemon = struct {
                 } else {
                     var conn_reader = (std.net.Stream{ .handle = fd }).reader(&read_buffer);
                     const conn = conn_reader.interface();
-                    //either a retain timer fd, old connection, or new connection
-                    const index = blk: for (d.message_cons.items, 0..) |mc, i| {
-                        if (mc.retain_timer_fd != null and mc.retain_timer_fd.? == fd) break :blk i;
-                        if (mc.con_fd != null and mc.con_fd.? == fd) break :blk i;
+
+                    const mc_index = blk: for (d.message_cons.items, 0..) |mc, i| {
+                        if (mc.con_fd == fd) break :blk i;
                     } else {
-                        const mc = try d.message_cons.addOne(d.alc);
                         const header = try conn.takeStruct(MessageHeader, .little);
                         const name = try conn.take(header.name_len);
+                        const mc = try d.message_cons.addOne(d.alc);
                         mc.* = .{
                             .con_fd = fd,
-                            .retain = header.retain,
                             .log = header.log,
                             .name_len = header.name_len,
                         };
                         @memcpy(mc.name_buf[0..mc.name_len], name);
-
-                        if (mc.retain != 0) {
-                            mc.retain_timer_fd = try std.posix.timerfd_create(std.os.linux.TIMERFD_CLOCK.REALTIME, .{});
-                            try addToEpoll(d.epoll_fd, mc.retain_timer_fd.?);
-                        }
                         break :blk d.message_cons.items.len - 1;
                     };
-
-                    const mc = &d.message_cons.items[index];
-
-                    if (mc.retain_timer_fd) |tfd| {
-                        if (tfd == fd) {
-                            mc.message_len = 0;
-                            _ = try std.posix.read(fd, &read_buffer); //reset timer MIGHT NOT BE NEEDED?
-                            if (mc.con_fd == null) {
-                                const EPOLL = std.os.linux.EPOLL;
-                                try std.posix.epoll_ctl(d.epoll_fd, EPOLL.CTL_DEL, fd, null);
-                                std.posix.close(fd);
-                                _ = d.message_cons.orderedRemove(index);
-                            }
-                            continue;
-                        } else {
-                            try std.posix.timerfd_settime(tfd, .{}, &.{
-                                .it_value = .{ .sec = mc.retain, .nsec = 0 },
-                                .it_interval = .{ .sec = 0, .nsec = 0 },
-                            }, null);
-                        }
-                    }
-                    std.debug.assert(fd == mc.con_fd.?);
+                    const mc = &d.message_cons.items[mc_index];
                     while (true) {
                         const msg = conn.takeDelimiterExclusive('\n') catch |err| switch (err) {
-                            error.StreamTooLong => unreachable,
+                            error.StreamTooLong => unreachable, //client will fold messages that are too long
                             error.EndOfStream => {
                                 const EPOLL = std.os.linux.EPOLL;
                                 try std.posix.epoll_ctl(d.epoll_fd, EPOLL.CTL_DEL, fd, null);
                                 std.posix.close(fd);
-                                mc.con_fd = null;
-                                if (mc.retain == 0) _ = d.message_cons.orderedRemove(index);
+                                _ = d.message_cons.orderedRemove(mc_index);
                                 break;
                             },
                             error.ReadFailed => switch (conn_reader.getError().?) {
