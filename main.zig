@@ -98,8 +98,8 @@ const Args = union(enum) {
 };
 
 pub fn main() !void {
-    const status_socket_name = "statusbar-0";
-    const log_file_name = "statusbar-0.log";
+    const status_socket_name = "statusbar";
+    const log_file_name = "statusbar.log";
 
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer std.debug.assert(.ok == gpa.deinit());
