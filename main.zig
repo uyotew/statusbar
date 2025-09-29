@@ -233,17 +233,12 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
     const epoll_fd = try std.posix.epoll_create1(0);
     defer std.posix.close(epoll_fd);
 
-    const EPOLL = std.os.linux.EPOLL;
-    {
-        var ev: std.os.linux.epoll_event = .{ .data = .{ .fd = cmd.stdout.?.handle }, .events = EPOLL.IN };
-        try std.posix.epoll_ctl(epoll_fd, EPOLL.CTL_ADD, cmd.stdout.?.handle, &ev);
-    }
+    try addToEpoll(epoll_fd, cmd.stdout.?.handle, .{});
 
     var timer_fd: ?std.posix.fd_t = null;
     if (args.retain != 0) {
         timer_fd = try std.posix.timerfd_create(std.os.linux.TIMERFD_CLOCK.REALTIME, .{});
-        var ev: std.os.linux.epoll_event = .{ .data = .{ .fd = timer_fd.? }, .events = EPOLL.IN | EPOLL.ET };
-        try std.posix.epoll_ctl(epoll_fd, EPOLL.CTL_ADD, timer_fd.?, &ev);
+        try addToEpoll(epoll_fd, timer_fd.?, .{ .edge_triggered = true });
     }
     var stream_ended = false;
     const wait_max_events = 16;
@@ -260,7 +255,7 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
                 var line = cmd_out.peekDelimiterExclusive('\n') catch |err| switch (err) {
                     error.EndOfStream => blk: {
                         stream_ended = true;
-                        try std.posix.epoll_ctl(epoll_fd, EPOLL.CTL_DEL, cmd.stdout.?.handle, null);
+                        try std.posix.epoll_ctl(epoll_fd, std.os.linux.EPOLL.CTL_DEL, cmd.stdout.?.handle, null);
                         break :blk cmd_out.buffered();
                     },
                     error.StreamTooLong => cmd_out.buffered(),
@@ -293,6 +288,16 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
         }
     }
     _ = try cmd.wait();
+}
+const AddEpollOpts = struct {
+    edge_triggered: bool = false,
+};
+fn addToEpoll(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t, opts: AddEpollOpts) !void {
+    const EPOLL = std.os.linux.EPOLL;
+    var events: u32 = EPOLL.IN;
+    if (opts.edge_triggered) events |= EPOLL.ET;
+    var ev: std.os.linux.epoll_event = .{ .data = .{ .fd = fd }, .events = events };
+    try std.posix.epoll_ctl(epoll_fd, EPOLL.CTL_ADD, fd, &ev);
 }
 
 const Daemon = struct {
@@ -337,13 +342,13 @@ const Daemon = struct {
         const epoll_fd = try std.posix.epoll_create1(0);
         errdefer std.posix.close(epoll_fd);
 
-        try addToEpoll(epoll_fd, signal_fd);
-        try addToEpoll(epoll_fd, audio.cmd.stdout.?.handle);
-        try addToEpoll(epoll_fd, server.stream.handle);
-        try addToEpoll(epoll_fd, datetime.timer_fd);
+        try addToEpoll(epoll_fd, signal_fd, .{});
+        try addToEpoll(epoll_fd, audio.cmd.stdout.?.handle, .{});
+        try addToEpoll(epoll_fd, server.stream.handle, .{});
+        try addToEpoll(epoll_fd, datetime.timer_fd, .{});
         if (battery) |b| {
-            try addToEpoll(epoll_fd, b.ac_netlink.sock.handle);
-            try addToEpoll(epoll_fd, b.timer_fd);
+            try addToEpoll(epoll_fd, b.ac_netlink.sock.handle, .{});
+            try addToEpoll(epoll_fd, b.timer_fd, .{});
         }
 
         const log_file = try std.fs.createFileAbsolute(log_path, .{});
@@ -360,11 +365,6 @@ const Daemon = struct {
             .datetime = datetime,
             .battery = battery,
         };
-    }
-    fn addToEpoll(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
-        const EPOLL = std.os.linux.EPOLL;
-        var ev: std.os.linux.epoll_event = .{ .data = .{ .fd = fd }, .events = EPOLL.IN };
-        try std.posix.epoll_ctl(epoll_fd, EPOLL.CTL_ADD, fd, &ev);
     }
 
     fn deinit(d: *Daemon, socket_path: []const u8, log_path: []const u8) void {
@@ -430,7 +430,7 @@ const Daemon = struct {
                     var flags = try std.posix.fcntl(conn.stream.handle, std.os.linux.F.GETFL, 0);
                     flags |= 1 << @bitOffsetOf(std.os.linux.O, "NONBLOCK");
                     _ = try std.posix.fcntl(conn.stream.handle, std.os.linux.F.SETFL, flags);
-                    try addToEpoll(d.epoll_fd, conn.stream.handle);
+                    try addToEpoll(d.epoll_fd, conn.stream.handle, .{});
                 } else if (fd == d.audio.cmd.stdout.?.handle) {
                     try d.audio.updateOnce();
                 } else if (fd == d.datetime.timer_fd) {
