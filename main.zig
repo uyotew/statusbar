@@ -460,28 +460,29 @@ const Daemon = struct {
                     };
                     const mc = &d.message_cons.items[mc_index];
                     while (true) {
-                        const msg = conn.takeDelimiterExclusive('\n') catch |err| switch (err) {
+                        const msg_or_eof = conn.takeDelimiter('\n') catch |err| switch (err) {
                             error.StreamTooLong => unreachable, //client will fold messages that are too long
-                            error.EndOfStream => {
-                                const EPOLL = std.os.linux.EPOLL;
-                                try std.posix.epoll_ctl(d.epoll_fd, EPOLL.CTL_DEL, fd, null);
-                                std.posix.close(fd);
-                                _ = d.message_cons.orderedRemove(mc_index);
-                                break;
-                            },
                             error.ReadFailed => switch (conn_reader.getError().?) {
                                 error.WouldBlock => break,
                                 else => |e| return e,
                             },
                         };
-                        mc.message_len = msg.len;
-                        @memcpy(mc.message_buf[0..mc.message_len], msg);
-                        if (mc.log) {
-                            const log = &d.log_writer.interface;
-                            try log.writeInt(i64, std.time.timestamp(), .little);
-                            if (mc.name_len > 0) try log.print("{s}: ", .{mc.name_buf[0..mc.name_len]});
-                            try log.print("{s}\n", .{mc.message_buf[0..mc.message_len]});
-                            try log.flush();
+                        if (msg_or_eof) |msg| {
+                            mc.message_len = msg.len;
+                            @memcpy(mc.message_buf[0..mc.message_len], msg);
+                            if (mc.log) {
+                                const log = &d.log_writer.interface;
+                                try log.writeInt(i64, std.time.timestamp(), .little);
+                                if (mc.name_len > 0) try log.print("{s}: ", .{mc.name_buf[0..mc.name_len]});
+                                try log.print("{s}\n", .{mc.message_buf[0..mc.message_len]});
+                                try log.flush();
+                            }
+                        } else {
+                            const EPOLL = std.os.linux.EPOLL;
+                            try std.posix.epoll_ctl(d.epoll_fd, EPOLL.CTL_DEL, fd, null);
+                            std.posix.close(fd);
+                            _ = d.message_cons.orderedRemove(mc_index);
+                            break;
                         }
                     }
                 }
