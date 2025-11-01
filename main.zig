@@ -14,7 +14,7 @@ fn usage(progname: []const u8) noreturn {
         \\usage: 
         \\  {0s} --start
         \\  {0s} --log
-        \\  {0s} [--log] [--name name | --no-name] [--retain s] cmd [args..]
+        \\  {0s} [--log] [--name name | --no-name] [--retain time] cmd [args..]
         \\     everything after options (cmd [args..]) will be given as a string to sh -c
         \\     and its output will be redirected to the statusbar daemon
         \\     if a line of output is too long, ({1} bytes) it will be folded
@@ -29,9 +29,11 @@ fn usage(progname: []const u8) noreturn {
         \\    --name name  every line output is prefixed with this name.
         \\                 uses cmd by default
         \\    --no-name    do not prefix output with anything
-        \\    --retain s   keep line visible for s seconds or until another
-        \\                 line overwrites it
-        \\                 if s is 0 (default), line will be visible
+        \\    --retain N[ms|s|m]
+        \\                 keep line visible for the time specified
+        \\                 (by default seconds) or
+        \\                 until another line overwrites it
+        \\                 if N is 0 (default), line will be visible
         \\                 as long as the program is running and 
         \\                 the line isn't overwritten
         \\ 
@@ -48,7 +50,7 @@ const Args = union(enum) {
         name: ?[]const u8 = null,
         cmd: []const []const u8,
         log: bool = false,
-        retain: u16 = 0,
+        retain_ms: u32 = 0,
     };
 
     fn parse(raw_args: []const []const u8) !Args {
@@ -81,10 +83,22 @@ const Args = union(enum) {
             } else if (std.mem.eql(u8, "--retain", arg)) {
                 args_idx += 1;
                 if (args_idx >= args.len) fatal("--retain expects an argument", .{});
-                send.retain = std.fmt.parseUnsigned(@TypeOf(send.retain), args[args_idx], 10) catch |err| switch (err) {
-                    error.Overflow => fatal("--retain can at most be {}", .{std.math.maxInt(@TypeOf(send.retain))}),
-                    error.InvalidCharacter => fatal("--retain invalid number: {s}", .{args[args_idx]}),
+                const timestr = args[args_idx];
+                const units_start = std.mem.indexOfAny(u8, timestr, "ms") orelse timestr.len;
+                const num = std.fmt.parseInt(u32, timestr[0..units_start], 10) catch |err| switch (err) {
+                    error.Overflow => fatal("--retain N can at most be {}", .{std.math.maxInt(u32)}),
+                    error.InvalidCharacter => fatal("--retain invalid number: {s}", .{timestr[0..units_start]}),
                 };
+                const units = timestr[units_start..];
+                if (std.mem.eql(u8, units, "") or std.mem.eql(u8, units, "s")) {
+                    send.retain_ms = std.math.mul(u32, num, std.time.ms_per_s) catch
+                        fatal("--retain number too large", .{});
+                } else if (std.mem.eql(u8, units, "m")) {
+                    send.retain_ms = std.math.mul(u32, num, std.time.ms_per_min) catch
+                        fatal("--retain number too large", .{});
+                } else if (std.mem.eql(u8, units, "ms")) {
+                    send.retain_ms = num;
+                } else fatal("--retain invalid units: {s}", .{units});
             } else break;
         }
         if (args_idx == args.len) fatal("expected cmd after options", .{});
@@ -236,7 +250,7 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
     try addToEpoll(epoll_fd, cmd.stdout.?.handle, .{});
 
     var timer_fd: ?std.posix.fd_t = null;
-    if (args.retain != 0) {
+    if (args.retain_ms != 0) {
         timer_fd = try std.posix.timerfd_create(std.os.linux.TIMERFD_CLOCK.REALTIME, .{});
         try addToEpoll(epoll_fd, timer_fd.?, .{ .edge_triggered = true });
     }
@@ -262,8 +276,10 @@ fn sendOutputToDaemon(alc: std.mem.Allocator, args: Args.Send, socket_path: []co
                     else => return err,
                 };
                 if (timer_fd) |tfd| {
+                    const secs = args.retain_ms / std.time.ms_per_s;
+                    const nsecs = (args.retain_ms % std.time.ms_per_s) * std.time.ns_per_ms;
                     try std.posix.timerfd_settime(tfd, .{}, &.{
-                        .it_value = .{ .sec = args.retain, .nsec = 0 },
+                        .it_value = .{ .sec = secs, .nsec = nsecs },
                         .it_interval = .{ .sec = 0, .nsec = 0 },
                     }, null);
                 }
